@@ -1,0 +1,53 @@
+[project]
+name = "animebot"
+version = "0.1.0"
+description = "动漫频道帖子检索 bot"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.15",
+    "aiosqlite>=0.20",
+    "orjson>=3.10",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "rapidfuzz>=3.9",
+    "structlog>=24.4",
+]
+
+[project.scripts]
+animebot = "animebot.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/animebot"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5",
+    "ruff>=0.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["_scratch"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ARG", "ASYNC", "PTH"]
+# RUF001/2/3 把中文全角标点当「可疑字符」。本项目注释和真实数据都是中文，
+# 全角标点是正确写法，不是笔误。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002"]   # 夹具常以参数形式注入而不被直接引用
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-q"

@@ -1,0 +1,17 @@
+# Windows 上开发、可能在 Linux 上部署：统一用 LF 存库，避免 CRLF 反复抖动
+# 造成的假 diff。
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sql   text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.lock  text eol=lf
+
+# uv.lock 是生成物：冲突时整份重新生成，不要手动合并
+uv.lock linguist-generated=true merge=binary
+
+*.db    binary
+*.png   binary
+*.jpg   binary

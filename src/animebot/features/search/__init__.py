@@ -10,7 +10,7 @@ from . import handlers
 
 class SearchFeature(BaseFeature):
     name = "search"
-    requires = ("repo", "search", "registry")
+    requires = ("repo", "search", "registry", "query_store")
 
     def router(self) -> Router:
         from ...bot.wiring import build_feature_router
@@ -20,7 +20,11 @@ class SearchFeature(BaseFeature):
         return router
 
     def health(self) -> dict[str, object]:
-        return {"status": "ok", "db": str(self.settings.db_path)}
+        return {
+            "status": "ok",
+            "db": str(self.settings.db_path),
+            "query_cache": len(self.container.get("query_store")),
+        }
 
 
 FEATURE = SearchFeature

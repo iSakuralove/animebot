@@ -58,6 +58,13 @@ uv run animebot run
 /search #百合 学园        标签 + 关键词
 ```
 
+结果多于一页时下面出现翻页行 `⏮ ◀ 4/72 ▶ ⏭`。序号是全局连续的（第 2 页显示
+9~16），关键词在标题里高亮。CLI 用 `--page` 翻页：
+
+```bash
+uv run animebot search "#漫改" -n 5 --page 3
+```
+
 ## 结构
 
 ```
@@ -86,7 +93,7 @@ src/animebot/
 ├── domain/              Post 模型 + 字段别名表
 ├── parsing/             帖子文本解析（不依赖 aiogram）
 ├── storage/             SQLite 仓储
-├── search/              检索服务 + 展示层
+├── search/              检索服务 + 展示层 + 分页编解码 + 高亮
 └── ingest/              导出回填 + 增量同步 + Message→导出形状转换
 ```
 
@@ -117,8 +124,19 @@ JSON 的形状，再喂给和回填完全相同的 `parse_message`。两份解�
 而 aiogram 给真 UTC。混用会让两批数据在 `ORDER BY posted_at` 里错开 8 小时。
 解析器优先读 `date_unixtime`。
 
-**`callback_data` 只放 `p:<message_id>`。** Telegram 上限 64 字节，真实数据里
-的 sharepoint 链接有 200+ 字符，往里塞 URL 必爆。
+**`callback_data` 只放 `p:<message_id>` 或 `s:<page>:<query>`。** 上限是 64
+**字节**不是字符，一个汉字 3 字节。查询词塞得下就内联（无状态、重启不失效），
+超长退到短 token + 进程内 LRU。真实数据里的 sharepoint 链接有 200+ 字符，
+往里塞 URL 必爆，而报错发生在用户点击时而非发送时，很难复现。
+见 [ADR-0010](docs/ADR/0010-pagination-state-in-callback-data.md)。
+
+**翻页不缓存结果集。** 一次完整检索实测 12~35ms，而缓存要处理失效、内存增长、
+「翻页时帖子被编辑了」的一致性问题。排序是全序，所以重查顺序一致，翻页不会
+重复或漏项。
+
+**高亮先在原文里定位，再逐段转义。** 顺序反了两种都错：先转义就得在 `&amp;`
+里找关键词，先插标签就会把 `<b>` 自己转义掉。另外不能用 `text.lower()` 的偏移
+切原文 —— `"İ".lower()` 是 2 个字符，会错位。
 
 ## 静默失败的防线
 
@@ -147,7 +165,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-163 个测试。两个是回归红线：
+241 个测试。两个是回归红线：
 
 - [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。

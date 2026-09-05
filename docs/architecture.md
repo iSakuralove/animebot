@@ -86,17 +86,23 @@ _adapt() 包装层 ─────────────────  按 hand
 cmd_search(message, search, settings, trace)
   │  参数名 → 容器里的键，自动注入
   ▼
-SearchService.search()
+SearchService.search_page()
   │  Query.parse → 拆词和标签
   │  repo.like_titles() 逐词取候选（并集）
-  │  rank_terms() 打分
+  │  rank_terms() 打分，sort_key 全序排序
   │  没命中 → _fuzzy() rapidfuzz 兜底
+  │  切出当前页 → SearchPage(hits, total, page, pages)
   ▼
-presenter.render_results() + results_keyboard()
-  │  callback_data 只放 p:<message_id>
+presenter.render_page() + page_keyboard()
+  │  高亮：先在原文定位，再逐段转义
+  │  callback_data: p:<message_id> / s:<page>:<query> / t:<page>:<token>
   ▼
 message.reply()
 ```
+
+翻页时走同一条路，只是把 `message.reply()` 换成 `callback.message.edit_text()`。
+分页状态全在 `callback_data` 里，服务端不存结果集
+（[ADR-0010](ADR/0010-pagination-state-in-callback-data.md)）。
 
 ### 中间件顺序为什么是这个
 
@@ -235,10 +241,10 @@ Telegram Desktop 导出 result.json          频道发新帖 / 编辑
                  SQLite (WAL)
                        │
                        ▼ search/service.py
-              LIKE 预筛 → rank 打分 → rapidfuzz 兜底
+              LIKE 预筛 → rank 打分 → rapidfuzz 兜底 → 切页
                        │
                        ▼ search/presenter.py
-              渲染 + 键盘（callback_data 只放 message_id）
+              渲染 + 高亮 + 键盘（callback_data 只放 id 和页码）
 ```
 
 两条入口在 `parse_message` 处汇合，之后完全共用。
@@ -260,7 +266,7 @@ src/animebot/
 ├── domain/              Post 模型 + 字段别名表
 ├── parsing/             entity 拍平、按行切 key、解析成 Post（不依赖 aiogram）
 ├── storage/             schema.sql + 异步仓储
-├── search/              检索服务 + 展示层
+├── search/              检索服务 + 展示层 + 分页编解码 + 高亮
 ├── ingest/              回填、增量同步、Message→导出形状的转换
 ├── bot/                 aiogram 装配：app / middlewares / wiring / loader / runner / preflight
 └── features/            业务模块，每个一个包

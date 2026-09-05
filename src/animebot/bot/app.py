@@ -16,6 +16,7 @@ from ..core.feature import BaseFeature
 from ..core.registry import CommandRegistry
 from ..ingest.sync import ChannelSync
 from ..observability.logging import get_logger, setup_logging
+from ..search.callbacks import QueryStore
 from ..search.service import SearchService
 from ..storage.repo import PostRepo
 from .loader import load_features
@@ -62,6 +63,8 @@ async def build_container(settings: Settings) -> Container:
     c.put("repo", repo, closer=repo.close)
     c.put("search", SearchService(repo, settings))
     c.put("sync", ChannelSync(repo, settings))
+    # 超长查询词的暂存。有界 LRU，丢了只会让翻页提示"搜索已过期"。
+    c.put("query_store", QueryStore(capacity=settings.query_store_size))
     return c
 
 
@@ -131,6 +134,7 @@ def _build_dispatcher(
     dp["repo"] = container.get("repo")
     dp["search"] = container.get("search")
     dp["sync"] = container.get("sync")
+    dp["query_store"] = container.get("query_store")
     dp["app"] = app
 
     # 顺序有意义：

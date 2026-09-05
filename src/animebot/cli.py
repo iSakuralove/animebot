@@ -96,15 +96,19 @@ async def cmd_search(args: argparse.Namespace) -> int:
     query = " ".join(args.query)
     async with PostRepo(cfg.db_path) as repo:
         svc = SearchService(repo, cfg)
-        hits = await svc.search(query, limit=args.limit)
-        if not hits:
+        page = await svc.search_page(query, page=args.page, page_size=args.limit)
+        if page.is_empty:
             print(f"没找到 {query!r}")
             return 1
-        print(f"{query!r} -> {len(hits)} 条\n")
-        for i, h in enumerate(hits, 1):
+        last = page.first_index + len(page.hits) - 1
+        print(
+            f"{query!r} -> 共 {page.total} 条"
+            f"（{page.first_index}-{last}，第 {page.page + 1}/{page.pages} 页）\n"
+        )
+        for i, h in enumerate(page.hits):
             p = h.post
             score = f"{p.score:.1f}" if p.score is not None else "--"
-            print(f"{i}. {p.title_cn}")
+            print(f"{page.first_index + i}. {p.title_cn}")
             print(
                 f"   评分 {score} {p.score_text} | {p.episodes or '?'}话 | "
                 f"{p.air_date or '?'} | #{' #'.join(p.tags[:5])}"
@@ -115,6 +119,8 @@ async def cmd_search(args: argparse.Namespace) -> int:
                 f"网盘: {', '.join(p.links) or '无'}"
             )
             print()
+        if page.has_next:
+            print(f"下一页: --page {page.page + 1}")
     return 0
 
 
@@ -167,7 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("search", help="命令行搜索")
     p.add_argument("query", nargs="+")
-    p.add_argument("-n", "--limit", type=int, default=8)
+    p.add_argument("-n", "--limit", type=int, default=8, help="每页条数")
+    p.add_argument("--page", type=int, default=0, help="页码（0-based）")
     p.set_defaults(fn=cmd_search)
 
     p = sub.add_parser("commands", help="列出所有已注册指令（不连 Telegram）")

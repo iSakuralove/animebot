@@ -38,6 +38,45 @@ class SearchHit:
 
 
 @dataclass(slots=True)
+class SearchPage:
+    """一页结果 + 分页所需的全部信息。
+
+    `total` 是过滤后的真实总数，不是 `len(hits)` —— 分页按钮要靠它算边界，
+    而「找到 8 条」和「找到 572 条只显示 8 条」对用户是完全不同的信息。
+    """
+
+    query: str
+    hits: list[SearchHit]     # 当前页
+    total: int                # 全部命中数
+    page: int                 # 0-based
+    page_size: int
+
+    @property
+    def pages(self) -> int:
+        """总页数。空结果也算 1 页，避免调用方到处判 0。"""
+        if self.page_size <= 0:
+            return 1
+        return max(1, -(-self.total // self.page_size))
+
+    @property
+    def first_index(self) -> int:
+        """当前页第一条在全局的序号（1-based），用于「3-10 / 共 572」这种显示。"""
+        return self.page * self.page_size + 1
+
+    @property
+    def has_prev(self) -> bool:
+        return self.page > 0
+
+    @property
+    def has_next(self) -> bool:
+        return self.page + 1 < self.pages
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.hits
+
+
+@dataclass(slots=True)
 class Query:
     text: str
     terms: list[str]
@@ -96,14 +135,47 @@ class SearchService:
         self._cfg = settings
 
     async def search(self, raw: str, limit: int | None = None) -> list[SearchHit]:
+        """取前 N 条。`/check` 和 CLI 用它，不需要知道分页。"""
+        page = await self.search_page(raw, page_size=limit or self._cfg.search_page_size)
+        return page.hits
+
+    async def search_page(
+        self, raw: str, *, page: int = 0, page_size: int | None = None
+    ) -> SearchPage:
+        """分页检索。
+
+        每次翻页都重新查库和重新排序，不缓存结果集。理由：一次完整检索实测
+        3~13ms（1639 行 LIKE + 200 个候选打分），而缓存要处理失效、内存增长、
+        以及「翻页时帖子被编辑了」的一致性问题。省下 10ms 不值这些复杂度。
+
+        排序是确定性的（`sort_key` 是全序），所以重新查得到的顺序完全一致，
+        翻页不会出现重复或漏项。
+        """
+        size = page_size or self._cfg.search_page_size
+        ranked = await self._rank_all(raw)
+        total = len(ranked)
+        # 越界的页码夹回最后一页，而不是返回空 —— 用户点了「末页」之后再点「下一页」
+        # 不该看到空列表。
+        last = max(0, -(-total // size) - 1) if total else 0
+        page = max(0, min(page, last))
+        start = page * size
+        return SearchPage(
+            query=raw,
+            hits=ranked[start : start + size],
+            total=total,
+            page=page,
+            page_size=size,
+        )
+
+    async def _rank_all(self, raw: str) -> list[SearchHit]:
+        """完整的候选集，已排序。分页只是对它切片。"""
         q = Query.parse(raw)
-        limit = limit or self._cfg.search_page_size
         cap = self._cfg.search_max_candidates
 
         # 纯标签查询
         if q.tags and not q.terms:
             posts = await self._repo.by_tags(q.tags, limit=cap)
-            return [SearchHit(p, 0.0, 0, "tag") for p in posts][:limit]
+            return [SearchHit(p, 0.0, 0, "tag") for p in posts]
 
         if not q.terms:
             return []
@@ -113,7 +185,9 @@ class SearchService:
         for term in q.terms:
             for p in await self._repo.like_titles(term, cap):
                 cand.setdefault(p.key, p)
-        if len(cand) < limit:   # 标题不够，扩到正文
+        # 标题候选不足一页就扩到正文。用固定阈值而不是 limit：分页时 limit 是
+        # 页大小，不该因为翻到第 3 页就改变候选集的构成。
+        if len(cand) < self._cfg.search_page_size:
             for term in q.terms:
                 for p in await self._repo.like_fulltext(term, cap):
                     cand.setdefault(p.key, p)
@@ -126,14 +200,14 @@ class SearchService:
                 hits.append(SearchHit(p, score, n, reason))
 
         if not hits:   # 可能打错字，退到模糊匹配
-            hits = await self._fuzzy(q.text.lower(), limit)
+            hits = await self._fuzzy(q.text.lower(), self._cfg.search_page_size)
 
         if q.tags:     # 标签当过滤器用
             want = set(q.tags)
             hits = [h for h in hits if want <= set(h.post.tags)]
 
         hits.sort(key=lambda h: h.sort_key)
-        return hits[:limit]
+        return hits
 
     async def check(self, raw: str) -> SearchHit | None:
         """判断这部番发过没有：搜索的特例，不是独立功能。"""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 
 from ..._util import command_arg
@@ -12,16 +13,26 @@ from ...config import Settings
 from ...core.errors import NotFound, UsageError
 from ...core.registry import command
 from ...observability.context import RequestContext, bind
+from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
+from ...search.callbacks import (
+    NOOP,
+    PREFIX_DETAIL,
+    PREFIX_INLINE,
+    PREFIX_TOKEN,
+    QueryStore,
+    decode_page,
+)
 from ...search.presenter import (
-    CB_DETAIL,
     detail_keyboard,
+    page_keyboard,
     render_detail,
-    render_results,
-    results_keyboard,
+    render_page,
 )
 from ...search.service import SearchService
 from ...storage.repo import PostRepo
+
+log = get_logger("animebot.search")
 
 
 @command(
@@ -32,7 +43,7 @@ from ...storage.repo import PostRepo
     rate=(6, 20),
     long_help=(
         "支持多个关键词（空格分隔，命中越多排越前）、错别字容错、"
-        "标签筛选。\n\n"
+        "标签筛选。结果多于一页时下面会出现翻页按钮。\n\n"
         "例子:\n"
         "/search 无职英雄\n"
         "/search 咒术回站      （打错字也能搜到）\n"
@@ -45,20 +56,24 @@ async def cmd_search(
     search: SearchService,
     settings: Settings,
     trace: RequestContext,
+    query_store: QueryStore,
 ) -> None:
     query = command_arg(message)
     if not query:
         raise UsageError("要搜什么？", "/search 无职英雄")
 
     bind(query=query[:80])
-    hits = await search.search(query)
-    METRICS.incr("search.query", found=bool(hits))
-    METRICS.observe("search.results", len(hits))
-    trace.bind(result_count=len(hits), reason=hits[0].reason if hits else "none")
+    page = await search.search_page(query)
+    METRICS.incr("search.query", found=not page.is_empty)
+    METRICS.observe("search.results", page.total)
+    trace.bind(
+        result_count=page.total,
+        reason=page.hits[0].reason if page.hits else "none",
+    )
 
     await message.reply(
-        render_results(query, hits, settings),
-        reply_markup=results_keyboard(hits),
+        render_page(page, settings),
+        reply_markup=page_keyboard(page, query_store),
     )
 
 
@@ -103,6 +118,44 @@ async def cmd_tags(message: Message, repo: PostRepo) -> None:
     await message.reply(f"<b>{title}</b>（共 {len(cloud)} 个）\n\n{body}")
 
 
+async def on_page(
+    callback: CallbackQuery,
+    search: SearchService,
+    settings: Settings,
+    query_store: QueryStore,
+) -> None:
+    """翻页：原地编辑消息，不发新的。
+
+    发新消息会让聊天记录被同一次搜索的十几个版本刷满。编辑是标准做法，
+    代价是要处理 "message is not modified"。
+    """
+    ref = decode_page(callback.data or "", query_store)
+    if ref is None:
+        # token 被 LRU 淘汰了。给明确提示而不是静默失败 —— 用户重搜一次就恢复。
+        await callback.answer("搜索已过期，请重新搜索", show_alert=True)
+        METRICS.incr("search.page_expired")
+        return
+
+    page = await search.search_page(ref.query, page=ref.page)
+    METRICS.incr("search.page_turn")
+    bind(query=ref.query[:80], page=ref.page)
+
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    try:
+        await callback.message.edit_text(
+            render_page(page, settings),
+            reply_markup=page_keyboard(page, query_store),
+        )
+    except TelegramBadRequest as exc:
+        # 内容完全没变时 Telegram 报这个。不是错误，用户重复点了同一页。
+        if "not modified" not in str(exc).lower():
+            raise
+    await callback.answer()
+
+
 async def on_detail(
     callback: CallbackQuery,
     repo: PostRepo,
@@ -121,6 +174,7 @@ async def on_detail(
 
     METRICS.incr("search.detail_open")
     if callback.message is not None:
+        # 详情作为新消息发出，保留原来的结果列表 —— 用户看完详情还要回去翻页
         await callback.message.answer(
             render_detail(post, settings),
             reply_markup=detail_keyboard(post, settings),
@@ -128,6 +182,16 @@ async def on_detail(
     await callback.answer()
 
 
+async def on_noop(callback: CallbackQuery) -> None:
+    """页码显示和到边界的占位按钮。必须 answer，否则客户端一直转圈。"""
+    await callback.answer()
+
+
 def register_callbacks(router: Router) -> None:
     """回调没有 @command 元数据，单独挂。"""
-    router.callback_query.register(on_detail, F.data.startswith(f"{CB_DETAIL}:"))
+    router.callback_query.register(on_detail, F.data.startswith(f"{PREFIX_DETAIL}:"))
+    router.callback_query.register(
+        on_page,
+        F.data.startswith(f"{PREFIX_INLINE}:") | F.data.startswith(f"{PREFIX_TOKEN}:"),
+    )
+    router.callback_query.register(on_noop, F.data == NOOP)

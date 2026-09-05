@@ -57,8 +57,15 @@ class Settings(BaseSettings):
 
     # ---- 检索 ----
     search_page_size: int = Field(default=8, ge=1, le=20)
-    search_max_candidates: int = Field(default=200, ge=20, le=2000)
+    # 候选集上限。必须 >= 全库帖子数，否则 SearchPage.total 会是个谎 ——
+    # 分页之前这只影响"少显示几条"，分页之后总数是用户可见的数字：
+    # #漫改 真实 572 条，cap=200 时界面显示"共 200 条 / 25 页"。
+    # 实测最坏情况（#漫改，572 条全排序）34ms，远在 100ms 目标内。
+    # 全库到 ~5 万条时这个数要重新评估，届时该换的是倒排索引而不是调大它。
+    search_max_candidates: int = Field(default=3000, ge=20, le=50000)
     fuzzy_min_score: int = Field(default=55, ge=0, le=100)
+    # 超长查询词（>64 字节）的 LRU 暂存容量。丢了只会让翻页提示"搜索已过期"。
+    query_store_size: int = Field(default=512, ge=16, le=10000)
 
     # ---- 外部 API（/bgm、/agent 之类都走这套）----
     http_timeout: float = Field(default=10.0, gt=0)

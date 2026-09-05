@@ -347,3 +347,56 @@ class PostRepo:
             ),
         )
         await self.conn.commit()
+
+    # ------------------------------------------------------------ 同步水位
+    async def mark_seen(self, channel_id: int, message_id: int, *, stored: bool) -> None:
+        """记录同步看到了一条消息。
+
+        `last_seen` 包含不入库的公告闲聊 —— 它回答「update 还在到达吗」。
+        `last_stored` 才是索引的进度。两个分开记，否则「一个月没发新番」和
+        「同步挂了」在数据上长得一模一样。
+
+        用 MAX() 而不是直接赋值：编辑旧帖会带来一个较小的 message_id，
+        直接赋值会让水位倒退。
+        """
+        now = _now()
+        await self.conn.execute(
+            "INSERT INTO sync_state (channel_id, last_seen_message_id, last_seen_at, "
+            "  last_stored_message_id, last_stored_at, seen_count, stored_count) "
+            "VALUES (?,?,?,?,?,1,?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET "
+            "  last_seen_message_id = MAX(last_seen_message_id, excluded.last_seen_message_id), "
+            "  last_seen_at         = excluded.last_seen_at, "
+            "  last_stored_message_id = MAX(last_stored_message_id, "
+            "                              excluded.last_stored_message_id), "
+            "  last_stored_at       = CASE WHEN excluded.stored_count > 0 "
+            "                              THEN excluded.last_stored_at "
+            "                              ELSE last_stored_at END, "
+            "  seen_count           = seen_count + 1, "
+            "  stored_count         = stored_count + excluded.stored_count",
+            (
+                channel_id,
+                message_id,
+                now,
+                message_id if stored else 0,
+                now if stored else "",
+                1 if stored else 0,
+            ),
+        )
+        await self.conn.commit()
+
+    async def sync_state(self, channel_id: int) -> dict[str, Any] | None:
+        async with self.conn.execute(
+            "SELECT * FROM sync_state WHERE channel_id=?", (channel_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def max_message_id(self, channel_id: int) -> int:
+        """库里最大的 message_id。缺口检测的下界。"""
+        async with self.conn.execute(
+            "SELECT COALESCE(MAX(message_id), 0) FROM posts WHERE channel_id=?",
+            (channel_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0

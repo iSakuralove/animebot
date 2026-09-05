@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import collections
+import datetime as dt
 import json
 
 import pytest
@@ -130,6 +131,35 @@ def test_shared_sheet_excluded(parsed) -> None:
         if "1q2JyP3A4lok0jhkN-Tl3N3D5uo8uDJFX" in p.links.get("sheet", "")
     ]
     assert not leaked, f"公用表格泄进了 {len(leaked)} 条帖子"
+
+
+def test_timestamps_are_utc_aware(parsed) -> None:
+    """时间必须是 aware UTC，且来自 date_unixtime 而不是本地时间字符串。
+
+    导出的 `date` 是导出机器的本地时间（这个频道全是 +08:00）。拿它当 UTC 会让
+    整批数据偏移 8 小时，而增量同步那边 aiogram 给的是真 UTC —— 两条入口错开
+    之后 ORDER BY posted_at 就会把新帖排到错误的位置。
+    """
+    posts, _ = parsed
+    assert all(p.posted_at.tzinfo is not None for p in posts), "出现 naive 时间"
+    assert all(
+        p.posted_at.utcoffset() == dt.timedelta(0) for p in posts
+    ), "posted_at 不是 UTC"
+    assert all(
+        p.edited_at is None or p.edited_at.utcoffset() == dt.timedelta(0)
+        for p in posts
+    ), "edited_at 不是 UTC"
+
+
+def test_utc_matches_unixtime(export_doc) -> None:
+    """逐条核对：解析出的 UTC 时间必须等于 date_unixtime 换算的结果。"""
+    msg = next(m for m in export_doc["messages"] if m.get("id") == 3948)
+    post = parse_message(msg, CHANNEL_ID)
+    assert post is not None
+    expected = dt.datetime.fromtimestamp(int(msg["date_unixtime"]), dt.UTC)
+    assert post.posted_at == expected
+    # 本地时间字符串是 16:54:31，UTC 应该是 08:54:31 —— 差 8 小时
+    assert post.posted_at.hour != 16, "把本地时间当成 UTC 了"
 
 
 def test_rejects_discussion_group_export(export_doc) -> None:

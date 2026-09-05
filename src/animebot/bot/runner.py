@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 
 from ..observability.logging import get_logger
-from .app import build_app, sync_bot_commands
+from .app import build_app, resolve_update_types, sync_bot_commands
+from .preflight import preflight
 
 log = get_logger("animebot.runner")
 
@@ -18,9 +19,14 @@ async def run_polling() -> None:
         await sync_bot_commands(app)
         me = await app.bot.get_me()
         log.info("bot.start", username=me.username, bot_id=me.id)
-        # 丢弃积压的 update：重启后不该把停机期间的历史指令全部重放一遍
-        await app.dp.start_polling(app.bot, handle_signals=False,
-                                   allowed_updates=app.dp.resolve_used_update_types())
+        # 频道自检：bot 不是管理员就收不到 channel_post，而那个失败是静默的。
+        # 只警告不阻断 —— 网络抖一下就拒绝启动是把可用性换成了洁癖。
+        app.channel_access = await preflight(app.bot, app.settings)
+        await app.dp.start_polling(
+            app.bot,
+            handle_signals=False,
+            allowed_updates=resolve_update_types(app.dp),
+        )
     finally:
         log.info("bot.stopping")
         await app.aclose()

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from ..domain.fields import (
@@ -30,18 +30,30 @@ SUMMARY_HEADS = frozenset({"故事简介", "概况介绍", "剧情简介", "简�
 _SCORE = re.compile(r"^([0-9]{1,2}(?:\.[0-9]+)?)\s*(.*)$")
 _URL = re.compile(r"https?://\S+")
 _DT_FMT = "%Y-%m-%dT%H:%M:%S"
+_EPOCH = datetime.min.replace(tzinfo=UTC)
 
 # 判为帖子所需的最低信号量
 _STRONG = frozenset({"title_cn", "episodes", "index", "tags", "air_date"})
 
 
-def _parse_dt(raw: str | None) -> datetime | None:
+def _parse_dt(msg: dict[str, Any], key: str) -> datetime | None:
+    """一律返回 aware UTC。
+
+    优先读 `<key>_unixtime`（导出里覆盖率 100%）——它是无歧义的绝对时间。
+    `date` 字段是**导出机器的本地时间**（这个频道的导出全是 +08:00），拿它当
+    UTC 会让时间整体偏移 8 小时，而增量同步那边 aiogram 给的是真 UTC，两条
+    入口就此错开。所有查询都 ORDER BY posted_at，错开的后果是新帖排错位置。
+    """
+    if (epoch := msg.get(f"{key}_unixtime")) is not None:
+        with contextlib.suppress(ValueError, TypeError, OSError):
+            return datetime.fromtimestamp(int(epoch), UTC)
+    raw = msg.get(key)
     if not raw:
         return None
-    try:
-        return datetime.strptime(raw, _DT_FMT)
-    except (ValueError, TypeError):
-        return None
+    with contextlib.suppress(ValueError, TypeError):
+        # 兜底：没有 unixtime 的老导出。当本地时间处理再转 UTC。
+        return datetime.strptime(raw, _DT_FMT).astimezone().astimezone(UTC)
+    return None
 
 
 def _is_summary_head(text: str) -> bool:
@@ -136,8 +148,8 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
     post = Post(
         channel_id=channel_id,
         message_id=int(msg["id"]),
-        posted_at=_parse_dt(msg.get("date")) or datetime.min,
-        edited_at=_parse_dt(msg.get("edited")),
+        posted_at=_parse_dt(msg, "date") or _EPOCH,
+        edited_at=_parse_dt(msg, "edited"),
         has_photo="photo" in msg,
         raw_text=full,
     )

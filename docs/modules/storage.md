@@ -25,6 +25,17 @@
 `search_blob` 存小写的理由：SQLite 的 `LIKE` 默认只对 ASCII 大小写不敏感，
 存小写 + 查询时 `.lower()` 让英文名匹配稳定，不依赖 collation。
 
+## 时间一律 aware UTC
+
+`posted_at` / `edited_at` 存 ISO 字符串，且**必须带时区**。
+
+不统一的后果很具体：导出 JSON 的 `date` 是导出机器的本地时间（+08:00），
+aiogram 给的是真 UTC。混用会让两批数据在 `ORDER BY posted_at` 里错开 8 小时
+——新帖排到错误的位置。
+
+归一化在解析层做（优先读 `date_unixtime`），仓储层只负责如实存取。
+`test_timestamps_are_utc_aware` 盯着这条。
+
 ## 没有迁移框架
 
 DDL 全是 `CREATE TABLE IF NOT EXISTS`，启动时无脑跑一次 `init_schema()`。
@@ -74,6 +85,22 @@ SELECT started_at, total, ok, partial, failed, note FROM ingest_runs ORDER BY id
 
 `finish_run` 在 `finally` 里调用 —— 中途崩了也要留下记录，否则最需要审计的
 那次反而没记录。
+
+## `sync_state`：双水位
+
+存在的唯一理由是**增量同步停止工作完全静默**。bot 被降权、被移出频道、
+`allowed_updates` 配漏了 —— 这些故障下进程活着、指令能用、日志干净。
+
+| 字段 | 含义 |
+|---|---|
+| `last_seen_message_id` | 同步看到的最大 id，**含**不入库的公告闲聊 |
+| `last_stored_message_id` | 索引实际更新到哪 |
+
+两个都要：只看 `last_stored` 的话，「一个月没发新番」和「同步彻底挂了」在
+数据上长得一模一样。`last_seen` 回答的是「update 还在到达吗」。
+
+更新用 `MAX()` 而不是直接赋值 —— 编辑旧帖会带来较小的 message_id，直接赋值
+会让水位倒退。有测试盯着（`test_watermark_never_regresses`）。
 
 ## 并发
 

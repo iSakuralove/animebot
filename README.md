@@ -31,7 +31,8 @@ uv run animebot run
 | 命令 | 用途 |
 |---|---|
 | `animebot ingest <路径>` | 从导出 JSON 全量回填，幂等 |
-| `animebot stats` | 库状态、解析成功率、标签分布 |
+| `animebot stats` | 库状态、解析成功率、标签分布、同步水位 |
+| `animebot syncstat` | 增量同步诊断：update 还在到达吗、索引更新到哪 |
 | `animebot search <关键词>` | 不连 Telegram 直接搜，调试用 |
 | `animebot commands` | 列出已注册指令，验证模块装配 |
 | `animebot run` | 启动 bot（long polling） |
@@ -45,7 +46,7 @@ uv run animebot run
 | `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引 |
 | `/help [指令]` | 从注册表自动生成 |
 | `/ping` | 测活，返回 trace_id |
-| `/health` `/metrics` | 管理员专用 |
+| `/health` `/metrics` `/syncstat` | 管理员专用 |
 
 搜索支持：
 
@@ -75,17 +76,18 @@ src/animebot/
 │   └── metrics.py       进程内计数器 + 直方图
 ├── bot/
 │   ├── app.py           装配：中间件顺序、模块加载、关停
-│   ├── middlewares.py   trace / 错误边界 / 权限 / 限流 / 埋点
+│   ├── middlewares.py   trace / 错误边界 / 权限 / 限流 / 埋点 / 频道同步
 │   ├── wiring.py        @command → aiogram Router
-│   └── loader.py        按名字动态加载模块
+│   ├── loader.py        按名字动态加载模块
+│   └── preflight.py     启动自检：bot 在频道里是管理员吗
 ├── features/            功能模块，加模块不改其它文件
-│   ├── system/          /help /ping /health /metrics /trace
+│   ├── system/          /help /ping /health /metrics /syncstat /trace
 │   └── search/          /search /check /tags
 ├── domain/              Post 模型 + 字段别名表
-├── parsing/             帖子文本解析
+├── parsing/             帖子文本解析（不依赖 aiogram）
 ├── storage/             SQLite 仓储
 ├── search/              检索服务 + 展示层
-└── ingest/              导出回填
+└── ingest/              导出回填 + 增量同步 + Message→导出形状转换
 ```
 
 ## 设计取舍
@@ -93,6 +95,10 @@ src/animebot/
 **装饰器只登记元数据，行为全在中间件。** `@command` 不包裹函数，所有保护
 （trace、埋点、限流、权限、错误边界）由中间件统一做一次。写新指令的人不可能
 「忘记加某个装饰器」而少一层保护，栈追踪也不会被多层包装搞脏。
+
+**两条数据入口共用同一个解析器。** 增量同步先把 aiogram `Message` 转成导出
+JSON 的形状，再喂给和回填完全相同的 `parse_message`。两份解析代码必然漂移
+—— 回填修的 bug 增量里还在，而黄金回归测试只覆盖回填那条路。
 
 **不用 FTS5。** 实测 trigram tokenizer 对中文 2 字查询全部未命中（要求至少
 3 字符），而 LIKE 全表扫 1639 行只要 0.5~3ms、rapidfuzz 模糊排序 10ms。
@@ -107,8 +113,29 @@ src/animebot/
 解析器要适应已发布的数据，而不是要求回去改 3000 个帖子。原文保留后，解析器
 改版可以整库重跑，不必重新导出。
 
+**时间一律 aware UTC。** 导出 JSON 的 `date` 是导出机器的本地时间（+08:00），
+而 aiogram 给真 UTC。混用会让两批数据在 `ORDER BY posted_at` 里错开 8 小时。
+解析器优先读 `date_unixtime`。
+
 **`callback_data` 只放 `p:<message_id>`。** Telegram 上限 64 字节，真实数据里
 的 sharepoint 链接有 200+ 字符，往里塞 URL 必爆。
+
+## 静默失败的防线
+
+这类故障下进程活着、指令能用、日志干净，只有某个功能悄悄不工作 —— 比崩溃更
+难发现，所以每一条都有主动检测：
+
+| 故障 | 防线 |
+|---|---|
+| bot 不是频道管理员 → 收不到 `channel_post` | 启动自检 + `/health` |
+| `allowed_updates` 漏了 `channel_post` | `resolve_update_types()` 显式补，有测试 |
+| 同步停了没人发现 | `sync_state` 双水位 + `/syncstat` |
+| 频道模板变了 | `sync.parse_failed` 埋点应始终为 0 |
+| 两条入口解析结果漂移 | `test_roundtrip_matches_export` |
+
+已知缺口：两个进程同用一个 token 时会各拿一半更新（409），而
+`TelegramConflictError` 从 polling 循环抛出、`ErrorBoundary` 抓不到。
+待部署时补单实例锁，见 [docs/ADR/0009](docs/ADR/0009-single-instance-lock.md)。
 
 ## 测试
 
@@ -120,9 +147,12 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-129 个测试，其中 [test_parser_golden.py](tests/test_parser_golden.py) 把 1639 个
-真实帖子当黄金数据集：`failed` 必须永远是 0，每个字段的填充数不许下降。解析器
-改坏了立刻红。
+163 个测试。两个是回归红线：
+
+- [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实帖子当
+  黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。
+- [test_sync.py](tests/test_sync.py) 的 `test_roundtrip_matches_export` ——
+  300 条真实消息反向构造成 aiogram Message，逐字段断言两条入口结果相同。
 
 基线（2026-09-05 实测）：
 
@@ -138,3 +168,13 @@ episodes  90.3%   staff      90.4%   score      89.7%
 
 见 [docs/adding_a_feature.md](docs/adding_a_feature.md)。要点：建一个包、导出
 `FEATURE`、往 `ANIMEBOT_FEATURES` 加名字。不改任何已有文件。
+
+## 文档
+
+| 想知道 | 看 |
+|---|---|
+| 做什么、不做什么、验收基线 | [docs/PRD.md](docs/PRD.md) |
+| 分层、依赖方向、一次请求的旅程 | [docs/architecture.md](docs/architecture.md) |
+| 某个决定为什么这么做 | [docs/ADR/](docs/ADR/README.md) |
+| 某层的契约和坑 | [docs/modules/](docs/modules/README.md) |
+| 部署、监控、排查 | [docs/operations.md](docs/operations.md) |

@@ -23,6 +23,9 @@ class ParseStatus(StrEnum):
 class Post:
     channel_id: int
     message_id: int
+    #: 一律 aware UTC。两条数据入口（导出 JSON / aiogram update）都在各自的
+    #: 解析层归一化到 UTC —— 混用 naive 和 aware 会让 ORDER BY posted_at
+    #: 在两批数据间错开 8 小时（导出的 date 是 +08:00 本地时间）。
     posted_at: datetime
     edited_at: datetime | None = None
 

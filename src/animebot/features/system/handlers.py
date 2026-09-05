@@ -17,6 +17,7 @@ from ..._util import command_arg, human_duration
 from ...config import Settings
 from ...core.errors import NotFound
 from ...core.registry import CommandRegistry, command
+from ...ingest.sync import ChannelSync
 from ...observability.context import RequestContext
 from ...observability.metrics import METRICS
 from ...storage.repo import PostRepo
@@ -83,6 +84,7 @@ async def cmd_health(
     repo: PostRepo,
     settings: Settings,
     registry: CommandRegistry,
+    app: object = None,
 ) -> None:
     breakdown = await repo.status_breakdown()
     lines = [
@@ -95,6 +97,58 @@ async def cmd_health(
         f"频道: <code>{settings.channel_id}</code> "
         f"({settings.link_mode} / @{settings.channel_username})",
         f"数据库: <code>{html.escape(str(settings.db_path))}</code>",
+    ]
+
+    # 各模块自报状态。BaseFeature.health() 定义了这个钩子，这里是唯一的读取点
+    # —— 不聚合的话那个钩子等于不存在。
+    features = getattr(app, "features", None) or []
+    if features:
+        lines.append("\n<b>模块</b>")
+        for f in features:
+            try:
+                info = f.health()
+            except Exception as exc:
+                # 一个模块坏了不该让 /health 整个挂掉 —— 那正是最需要它的时候
+                info = {"status": "error", "error": type(exc).__name__}
+            mark = "🟢" if info.get("status") == "ok" else "🔴"
+            detail = "  ".join(
+                f"{k}={html.escape(str(v))}" for k, v in info.items() if k != "status"
+            )
+            lines.append(f"{mark} <code>{f.name}</code> {detail}".rstrip())
+
+    # 频道可达性：bot 不是管理员就收不到 channel_post，而那个失败完全静默
+    access = getattr(app, "channel_access", None)
+    if access is not None:
+        mark = "🟢" if access.ok else "🔴"
+        lines.append(f"\n<b>增量同步</b>\n{mark} 频道身份: <code>{access.status}</code>")
+        if not access.ok:
+            lines.append(html.escape(access.hint))
+
+    await message.reply("\n".join(lines))
+
+
+@command("syncstat", desc="增量同步水位", admin_only=True)
+async def cmd_syncstat(message: Message, sync: ChannelSync, settings: Settings) -> None:
+    """回答两个问题：update 还在到达吗？索引更新到哪了？
+
+    这两个必须分开看 —— 只看「索引更新到哪」的话，一个月没发新番和同步彻底
+    挂掉长得一模一样。
+    """
+    r = await sync.gap_report()
+    if not r["seen_count"]:
+        await message.reply(
+            "<b>增量同步</b>\n还没收到过任何频道消息。\n\n"
+            "要么频道确实没发新帖，要么 bot 不是频道管理员 —— 用 /health 看频道身份。"
+        )
+        return
+    lines = [
+        "<b>增量同步</b>",
+        f"最近收到: <code>#{r['last_seen_message_id']}</code> "
+        f"{html.escape(r['last_seen_at'])}",
+        f"最近入库: <code>#{r['db_max_message_id']}</code> "
+        f"{html.escape(r['last_stored_at'] or '—')}",
+        f"累计: 收到 {r['seen_count']} 条 / 入库 {r['stored_count']} 条",
+        f"频道: <code>{settings.channel_id}</code>",
     ]
     await message.reply("\n".join(lines))
 

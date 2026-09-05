@@ -1,7 +1,15 @@
 # 增量同步设计
 
-**状态**：设计完成，待实现
-**日期**：2026-09-05
+**状态**：已实现（2026-09-05）
+**代码**：[update_adapter.py](../../src/animebot/ingest/update_adapter.py) ·
+[sync.py](../../src/animebot/ingest/sync.py) ·
+[preflight.py](../../src/animebot/bot/preflight.py) ·
+`ChannelSyncMiddleware`
+**测试**：[test_sync.py](../../tests/test_sync.py)（25 条）·
+[test_sync_middleware.py](../../tests/test_sync_middleware.py)（7 条）
+
+契约与坑的日常参考看 [modules/ingest.md](../modules/ingest.md)。这份文档留下
+**设计过程**：当时面对什么、为什么这么选、实测发现了什么。
 
 ## 问题
 
@@ -164,13 +172,50 @@ sync.latency
 3. **UTF-16 偏移的回归测试** —— 专门用 `💙故事简介` 开头的帖子，验证链接
    归属没有错位。
 
-## 实施顺序
+## 实施后的修正
 
-1. `ingest/update_adapter.py` + 单元测试（不碰 bot 层，可独立验证）
-2. 端到端一致性测试（此时还没有中间件，直接调函数）
-3. `bot/middlewares.py` 加 `ChannelSyncMiddleware`
-4. `app.py` 挂进中间件链
-5. 启动时检测 bot 是否在频道里，不在就 warning
-6. `/resync` 缺口报告（管理员指令）
+设计文档写完之后，实测推翻了两处，加了一处。
 
-前两步做完，正确性已经被测试覆盖住了。后面几步是接线。
+**一、`edit_date` 不是 datetime。** 设计里假设它和 `date` 一样是 datetime，
+实测 aiogram 3.31 里它是 `int | None`。假设错了会在被编辑过的帖子上抛
+`AttributeError` —— 而这个频道 1486/1486 都编辑过，等于每条增量都炸。
+`_epoch()` 现在两种都接。
+
+**二、时区问题设计时完全没看见。** 导出 JSON 的 `date` 是导出机器的本地时间
+（+08:00），而 aiogram 给 UTC。两条入口错开 8 小时，`ORDER BY posted_at` 会
+把新帖排错位置。解析器改成优先读 `date_unixtime`（覆盖率 100%），
+`Post.posted_at` 统一 aware UTC。
+
+这个 bug 只在两条入口同时存在时才显形，所以回填单独跑的时候一直是"对的"。
+
+**三、加了双水位表。** 设计里只写了「对账靠 `/resync`」，但那是人工触发的
+—— 没人会主动去查一个看起来正常的系统。`sync_state` 表在每条 update 上更新
+`last_seen`（含不入库的公告）和 `last_stored`，`/syncstat` 一眼看出
+「update 还在到达吗」和「索引更新到哪了」。
+
+只记 `last_stored` 不够：一个月没发新番和同步彻底挂掉，在数据上长得一样。
+
+## 另外发现的两个静默失败
+
+都不在原设计里，都是实现时才想到要验证的。
+
+**`allowed_updates` 会漏掉 `channel_post`。** 同步做成中间件，而
+`dp.resolve_used_update_types()` 只扫 handler —— 它算出来的列表里没有
+`channel_post`，传给 `start_polling` 之后 Telegram 就再也不推频道帖。
+同步永久静默失效，日志一片安静。
+
+实测确认：只有 message handler 时返回 `['message']`；注册了 channel_post
+handler 才返回 `['channel_post', 'message']`。所以 `resolve_update_types()`
+显式并上那两个类型，并且有测试盯着。
+
+**ErrorBoundary 会在频道里公开发道歉。** `channel_post` 也是 `Message`，
+`_reply()` 不挡住的话，一次同步异常就会让 bot 在 3000 人的频道里发
+「内部错误，编号 a1b2c3d4」。现在遇到 `ChatType.CHANNEL` 直接抑制并记
+`reply.suppressed_in_channel`。
+
+## 遗留
+
+**`/resync` 缺口报告没做完。** `gap_report()` 已经能算缺口，但"探频道当前
+水位"那一步（发一条消息再删）还没接 —— 它需要真实频道权限才能验证，等部署
+时和监控一起做。现在 `gap_report()` 不传 `live_max_id` 就只报库内水位，不会
+编一个假的 gap 出来。

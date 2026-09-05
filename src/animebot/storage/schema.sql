@@ -68,3 +68,22 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     upserted    INTEGER NOT NULL DEFAULT 0,
     note        TEXT    NOT NULL DEFAULT ''
 );
+
+-- 增量同步的水位。存在的唯一理由：**同步停止工作是完全静默的**。
+--
+-- bot 被降权、被移出频道、allowed_updates 配漏了 channel_post —— 这些故障下
+-- 进程活着、指令能用、日志干净，只有索引悄悄不再更新。等到有人问「怎么搜不到
+-- 新番」时已经过了几个月。
+--
+-- last_seen 记的是「同步看到的最大 message_id」，包含公告闲聊那些不入库的消息，
+-- 所以它反映的是「update 还在到达吗」；last_stored 才是「索引更新到哪了」。
+-- 两个都要：只看 last_stored 的话，一个月没发新番和同步挂了长得一样。
+CREATE TABLE IF NOT EXISTS sync_state (
+    channel_id              INTEGER PRIMARY KEY,
+    last_seen_message_id    INTEGER NOT NULL DEFAULT 0,
+    last_seen_at            TEXT    NOT NULL DEFAULT '',
+    last_stored_message_id  INTEGER NOT NULL DEFAULT 0,
+    last_stored_at          TEXT    NOT NULL DEFAULT '',
+    seen_count              INTEGER NOT NULL DEFAULT 0,
+    stored_count            INTEGER NOT NULL DEFAULT 0
+);

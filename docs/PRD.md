@@ -38,27 +38,27 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 | 功能 | 说明 |
 |---|---|
 | 全量回填 | 从导出 JSON 灌库，幂等，带频道 id 校验 |
+| **增量同步** | `channel_post` + `edited_channel_post` 实时入库，与回填共用解析器 |
 | `/search` | 多词、错别字容错、`#标签` 筛选 |
 | `/check` | 只回答发过 / 没发过 |
 | `/tags` | 标签列表 + 拼音首字母索引 |
 | `/help` | 从注册表自动生成，加指令不用手写帮助 |
 | `/ping` `/trace` | 测活、看本次请求的追踪信息 |
-| `/health` `/metrics` | 管理员专用 |
-| CLI | `ingest` / `stats` / `search` / `commands` / `run` |
+| `/health` `/metrics` `/syncstat` | 管理员专用 |
+| CLI | `ingest` / `stats` / `syncstat` / `search` / `commands` / `run` |
 | 模块化框架 | 加模块 = 建一个包 + 加一个名字，不改已有文件 |
-| 可观测性 | trace_id 全链路、结构化日志、进程内埋点 |
+| 可观测性 | trace_id 全链路、结构化日志、进程内埋点、同步双水位 |
 
 ### 路线图
 
 按依赖顺序，不是愿望清单：
 
-1. **增量同步** —— 当前唯一有时效性的缺口。数据是 2026-09-05 快照，之后发的帖子不进库。
-   设计见 [design/incremental-sync.md](design/incremental-sync.md)。
-2. **搜索分页** —— `#漫改` 有 572 个帖子，现在只返回 8 条。
-3. **`/bgm`** —— 查 Bangumi。第一个真外部 API 模块，验证 `HttpClient` 够不够用。
-4. **`/agent`** —— LLM 问答。范围待定（只答频道里有的 / 通用动漫知识），
+1. **搜索分页** —— `#漫改` 有 572 个帖子，现在只返回 8 条。
+2. **`/bgm`** —— 查 Bangumi。第一个真外部 API 模块，验证 `HttpClient` 够不够用。
+3. **`/agent`** —— LLM 问答。范围待定（只答频道里有的 / 通用动漫知识），
    这个决定会导致完全不同的架构。
-5. **监控与部署** —— 单实例锁、health 聚合、心跳推送。见 [operations.md](operations.md)。
+4. **监控与部署** —— 单实例锁、心跳推送、`/resync` 缺口探测。
+   见 [operations.md](operations.md)。三者都需要真实运行环境才能验证。
 
 ### 明确不做
 
@@ -109,17 +109,33 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 
 ### 工程质量
 
-- `uv run pytest` 全绿
+- `uv run pytest` 全绿（163 条）
 - `uv run ruff check src tests` 无告警
 - 加一个新指令模块不需要改 `app.py` / `cli.py` / 任何已有文件
 - 用户看到的错误：`UserError` 给原文，真 bug 给 8 位 trace_id，永不喷栈追踪
+- **两条数据入口的解析结果逐字段相同** —— `test_roundtrip_matches_export`
+  拿 300 条真实消息反向构造成 aiogram Message 对比。没这条测试，adapter 写错
+  只表现为「新帖少了几个链接」，几个月都发现不了。
+
+### 静默失败的防线
+
+这类故障下进程活着、指令能用、日志干净，只有功能悄悄不工作 —— 所以每一条都
+必须有主动检测：
+
+| 故障 | 防线 |
+|---|---|
+| bot 不是频道管理员 → 收不到 `channel_post` | 启动自检 + `/health` 显示频道身份 |
+| `allowed_updates` 漏了 `channel_post` | `resolve_update_types()` 显式补上，有测试 |
+| 同步停止但没人发现 | `sync_state` 双水位 + `/syncstat` |
+| 频道模板变了 | `sync.parse_failed` 埋点，应始终为 0 |
+| 两个进程同用一个 token（409 静默半坏） | **未实现** —— 见 [ADR-0009](ADR/0009-single-instance-lock.md) |
 
 ## 用户与权限
 
 只有两种角色，不做更细的：
 
 - **普通用户** —— `/search` `/check` `/tags` `/help` `/ping`
-- **管理员**（`ANIMEBOT_ADMIN_IDS`）—— 额外有 `/health` `/metrics`
+- **管理员**（`ANIMEBOT_ADMIN_IDS`）—— 额外有 `/health` `/metrics` `/syncstat`
 
 ## 非功能要求
 

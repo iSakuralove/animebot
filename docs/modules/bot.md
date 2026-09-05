@@ -7,7 +7,8 @@
 | [app.py](../../src/animebot/bot/app.py) | 启动顺序、中间件顺序、关停 |
 | [loader.py](../../src/animebot/bot/loader.py) | 按名字动态 import 功能模块 |
 | [wiring.py](../../src/animebot/bot/wiring.py) | `@command` → aiogram Router |
-| [middlewares.py](../../src/animebot/bot/middlewares.py) | trace / 埋点 / 错误边界 / 限流 / 权限 |
+| [middlewares.py](../../src/animebot/bot/middlewares.py) | trace / 埋点 / 错误边界 / 限流 / 权限 / 频道同步 |
+| [preflight.py](../../src/animebot/bot/preflight.py) | 启动自检：bot 在频道里是管理员吗 |
 
 ## 中间件顺序是设计，不是偏好
 
@@ -16,17 +17,20 @@ Trace          ← 最外。之后所有日志自动带 trace_id
   ErrorBoundary   ← 次之。下游一切异常都被兜住
     Access          ← 抛 PermissionDenied
       RateLimit       ← 抛 RateLimited
-        Observability   ← 最内。只计时真正的业务处理
-          handler
+        Observability   ← 计时真正的业务处理
+          ChannelSync     ← 最内。频道帖不该过限流/权限，但要被计时
+            handler
 ```
 
-三条约束决定了这个顺序，改动前先确认没破坏它们：
+四条约束决定了这个顺序，改动前先确认没破坏它们：
 
 1. **Trace 必须最外** —— 它之后的任何日志都要带 trace_id，包括错误边界打的日志。
 2. **Access 和 RateLimit 必须在 ErrorBoundary 内侧** —— 它们抛的是 `UserError`，
    要被 ErrorBoundary 转成用户看得懂的回复。放外侧就变成未捕获异常。
-3. **Observability 最内** —— 计时不该包含中间件自己的开销，否则 p95 里混着
-   限流查表的时间。
+3. **Observability 在它们内侧** —— 计时不该包含中间件自己的开销，否则 p95 里
+   混着限流查表的时间。
+4. **ChannelSync 最内** —— 频道帖没有"用户"也没有"配额"，不该过限流和权限；
+   但同步耗时要被计时，所以在 Observability 内侧。
 
 ## ErrorBoundary：唯一的兜底出口
 
@@ -39,8 +43,36 @@ BotError    → user_message + trace_id，日志 error
 用户报「出错了，编号 a1b2c3d4」，`grep a1b2c3d4 logs/animebot.jsonl` 直接
 定位到那一次请求的完整链路。这是 8 位 trace_id 的全部意义。
 
-`_reply()` 内部自己 try/except：**回复失败不能再抛**，否则变成 aiogram 的
-未处理异常，栈追踪里看不到原始错误。
+`_reply()` 有两条硬规矩：
+
+1. **绝不往频道里发消息。** `channel_post` 也是 `Message` —— 不挡住的话，一次
+   同步异常就会让 bot 在 3000 人的频道里公开发「内部错误，编号 xxx」。
+   遇到 `ChatType.CHANNEL` 直接抑制并记 `reply.suppressed_in_channel`。
+2. **回复失败不能再抛**，否则变成 aiogram 的未处理异常，栈追踪里看不到原始错误。
+
+## `allowed_updates` 的坑
+
+同步做成中间件，而 `dp.resolve_used_update_types()` **只扫 handler** ——
+它算出来的列表里没有 `channel_post`，传给 `start_polling` 之后 Telegram 就
+再也不推频道帖。同步永久静默失效，日志一片安静。
+
+实测：只有 message handler 时返回 `['message']`；注册了 channel_post handler
+才返回 `['channel_post', 'message']`。
+
+所以 `resolve_update_types()` 显式并上 `("channel_post", "edited_channel_post")`，
+[test_sync_middleware.py](../../tests/test_sync_middleware.py) 有测试盯着。
+
+## 启动自检
+
+`preflight()` 查 bot 在目标频道的身份。Bot API 的 `channel_post` **只推给频道
+的管理员 bot** —— bot 没加进频道或被降权，Telegram 一条 update 都不推，而这个
+失败完全静默。
+
+只警告不阻断：网络抖一下就拒绝启动是把可用性换成了洁癖。结论存进
+`App.channel_access`，`/health` 读它显示。
+
+顺带校验配的 `channel_username` 和频道实际的是否一致 —— 不一致的话公开深链
+会指向错误的频道或 404。
 
 ## ErrorBoundary 抓不到什么
 

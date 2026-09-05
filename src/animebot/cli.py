@@ -2,6 +2,7 @@
 
     python -m animebot ingest "C:\\...\\频道json数据"
     python -m animebot stats
+    python -m animebot syncstat
     python -m animebot search 无职英雄
     python -m animebot search "#奇幻 #异世界"
     python -m animebot commands
@@ -16,6 +17,7 @@ import sys
 
 from .config import get_settings
 from .ingest.export_loader import ExportMismatch, ingest_export
+from .ingest.sync import ChannelSync
 from .observability.context import request_context
 from .observability.logging import setup_logging
 from .search.service import SearchService
@@ -55,6 +57,37 @@ async def cmd_stats(_args: argparse.Namespace) -> int:
         print("热门标签  : " + "  ".join(f"#{t}({n})" for t, n in tags))
         idx = await repo.tag_cloud("index", limit=10)
         print("引索      : " + "  ".join(f"#{t}({n})" for t, n in idx))
+
+        state = await repo.sync_state(cfg.channel_id)
+        if state:
+            print(
+                f"增量同步  : 最近收到 #{state['last_seen_message_id']} "
+                f"({state['last_seen_at']}) / "
+                f"收到 {state['seen_count']} 入库 {state['stored_count']}"
+            )
+        else:
+            print("增量同步  : 还没收到过频道消息")
+    return 0
+
+
+async def cmd_syncstat(_args: argparse.Namespace) -> int:
+    """诊断同步是否还在工作。不连 Telegram，只读库里的水位。"""
+    cfg = get_settings()
+    async with PostRepo(cfg.db_path) as repo:
+        await repo.init_schema()
+        sync = ChannelSync(repo, cfg)
+        r = await sync.gap_report()
+        print(f"频道          : {cfg.channel_id} (@{cfg.channel_username})")
+        print(f"库里最大 id   : #{r['db_max_message_id']}")
+        print(f"最近收到      : #{r['last_seen_message_id']}  {r['last_seen_at'] or '—'}")
+        print(f"最近入库时间  : {r['last_stored_at'] or '—'}")
+        print(f"累计          : 收到 {r['seen_count']}  入库 {r['stored_count']}")
+        if not r["seen_count"]:
+            print(
+                "\n还没收到过任何频道消息。要么频道确实没发新帖，"
+                "要么 bot 不是频道管理员 —— 后者收不到 channel_post 且完全静默。"
+            )
+            return 1
     return 0
 
 
@@ -128,6 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("stats", help="看库状态")
     p.set_defaults(fn=cmd_stats)
+
+    p = sub.add_parser("syncstat", help="增量同步水位（诊断同步是否还在工作）")
+    p.set_defaults(fn=cmd_syncstat)
 
     p = sub.add_parser("search", help="命令行搜索")
     p.add_argument("query", nargs="+")

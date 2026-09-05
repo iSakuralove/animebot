@@ -22,6 +22,20 @@
 - **不做去重、不做入库。** 返回 `Post` 对象就结束，写不写库不关它的事。
 - **不校验语义合法性。** `话数: 十二` 会原样存进 `episodes`，不会报错。
   帖子已经发出去了，改不了，解析器的职责是尽量读懂而不是判卷。
+- **不 import aiogram。** 输入永远是一个 dict（导出 JSON 的形状）。增量同步那边
+  由 [`update_adapter`](../../src/animebot/ingest/update_adapter.py) 先把
+  `Message` 转成这个形状。这条边界让解析器能被 1639 个帖子的黄金数据集单独
+  测试，不需要造任何 aiogram 对象。
+
+## 时间：只读 `date_unixtime`
+
+`_parse_dt()` 优先读 `<key>_unixtime`（导出里覆盖率 100%），退回 `date` 字符串。
+
+因为 `date` 是**导出机器的本地时间** —— 这个频道的导出全是 +08:00。拿它当 UTC
+会让整批数据偏移 8 小时，而增量同步那边 aiogram 给的是真 UTC，两条入口就此
+错开，`ORDER BY posted_at` 把新帖排错位置。
+
+输出一律 aware UTC。
 
 ## 坑一：`text` 字段有两种形态
 

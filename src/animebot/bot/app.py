@@ -14,17 +14,20 @@ from ..core.container import Container
 from ..core.errors import ConfigError
 from ..core.feature import BaseFeature
 from ..core.registry import CommandRegistry
+from ..ingest.sync import ChannelSync
 from ..observability.logging import get_logger, setup_logging
 from ..search.service import SearchService
 from ..storage.repo import PostRepo
 from .loader import load_features
 from .middlewares import (
     AccessMiddleware,
+    ChannelSyncMiddleware,
     ErrorBoundary,
     ObservabilityMiddleware,
     RateLimitMiddleware,
     TraceMiddleware,
 )
+from .preflight import ChannelAccess
 
 log = get_logger("animebot.app")
 
@@ -37,6 +40,8 @@ class App:
     features: list[BaseFeature] = field(default_factory=list)
     bot: Bot | None = None
     dp: Dispatcher | None = None
+    #: 启动自检的结论，由 runner 填。/health 读它回答「增量同步在工作吗」。
+    channel_access: ChannelAccess | None = None
 
     async def aclose(self) -> None:
         for f in reversed(self.features):
@@ -56,6 +61,7 @@ async def build_container(settings: Settings) -> Container:
     await repo.init_schema()
     c.put("repo", repo, closer=repo.close)
     c.put("search", SearchService(repo, settings))
+    c.put("sync", ChannelSync(repo, settings))
     return c
 
 
@@ -124,19 +130,23 @@ def _build_dispatcher(
     dp["container"] = container
     dp["repo"] = container.get("repo")
     dp["search"] = container.get("search")
+    dp["sync"] = container.get("sync")
     dp["app"] = app
 
     # 顺序有意义：
     #   Trace 最外 —— 后面所有日志都要 trace_id。
     #   ErrorBoundary 次之 —— 它下游的一切异常都被兜住，包括限流和权限。
     #   Access / RateLimit 抛的 UserError 要能被 ErrorBoundary 抓到，所以在它内侧。
-    #   Observability 最内 —— 只计时真正的业务处理，不含中间件开销。
+    #   Observability 在它们内侧 —— 只计时真正的业务处理，不含中间件开销。
+    #   ChannelSync 最内 —— 频道帖不该经过限流/权限（那是给用户指令的），
+    #     但要被计时和埋点，所以放在 Observability 内侧。
     for mw in (
         TraceMiddleware(registry),
         ErrorBoundary(),
         AccessMiddleware(registry, settings.admin_ids),
         RateLimitMiddleware(registry),
         ObservabilityMiddleware(settings),
+        ChannelSyncMiddleware(container.get("sync")),
     ):
         dp.update.outer_middleware(mw)
     return dp
@@ -153,3 +163,13 @@ async def sync_bot_commands(app: App) -> None:
     if cmds:
         await app.bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
         log.info("bot.commands_synced", count=len(cmds))
+
+
+# 增量同步靠中间件而不是 handler（理由见 ChannelSyncMiddleware 的 docstring），
+# 而 resolve_used_update_types() 只扫 handler —— 它会漏掉 channel_post，
+# Telegram 就再也不推频道帖了，同步永久静默失效。所以显式补上。
+_SYNC_UPDATES = ("channel_post", "edited_channel_post")
+
+
+def resolve_update_types(dp: Dispatcher) -> list[str]:
+    return sorted(set(dp.resolve_used_update_types()) | set(_SYNC_UPDATES))

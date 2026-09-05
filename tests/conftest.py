@@ -49,6 +49,13 @@ def search(repo: PostRepo, settings: Settings) -> SearchService:
     return SearchService(repo, settings)
 
 
+@pytest.fixture
+def search_service_factory(repo: PostRepo, settings: Settings) -> SearchService:
+    """与 `search` 同一个对象，另起名字给 sync 测试用 —— 那里 `sync` 已经
+    是夹具名，再叫 `search` 会让「同步后能否搜到」这个断言的意图变模糊。"""
+    return SearchService(repo, settings)
+
+
 def make_post(
     message_id: int = 1,
     title_cn: str = "测试番剧",
@@ -58,7 +65,7 @@ def make_post(
     defaults: dict[str, object] = {
         "channel_id": CHANNEL_ID,
         "message_id": message_id,
-        "posted_at": dt.datetime(2025, 1, 1, 12, 0, 0),
+        "posted_at": dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=dt.UTC),
         "title_cn": title_cn,
         "parse_status": ParseStatus.OK,
     }

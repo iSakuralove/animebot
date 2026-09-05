@@ -12,11 +12,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
+from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
 from ..config import Settings
 from ..core.errors import BotError, PermissionDenied, RateLimited, UserError
 from ..core.registry import CommandRegistry, CommandSpec
+from ..ingest.sync import ChannelSync
 from ..observability.context import RequestContext, reset_context, set_context
 from ..observability.logging import get_logger
 from ..observability.metrics import METRICS
@@ -137,10 +139,19 @@ class ErrorBoundary(BaseMiddleware):
 
 
 async def _reply(event: TelegramObject, text: str) -> None:
-    """尽力回复。回复本身失败也不能再抛 —— 那会变成 aiogram 的未处理异常。"""
+    """尽力回复。两条硬规矩：
+
+    1. **绝不往频道里发消息。** channel_post 也是 Message，不挡住的话一次同步
+       异常就会让 bot 在 3000 人的频道里公开发「内部错误，编号 xxx」。
+    2. 回复本身失败也不能再抛 —— 那会变成 aiogram 的未处理异常，栈追踪里
+       看不到原始错误。
+    """
     inner = event.event if isinstance(event, Update) else event
     try:
         if isinstance(inner, Message):
+            if inner.chat.type == ChatType.CHANNEL:
+                log.warning("reply.suppressed_in_channel", text_head=text[:60])
+                return
             await inner.reply(text)
         elif isinstance(inner, CallbackQuery):
             await inner.answer(text[:200], show_alert=True)
@@ -220,3 +231,47 @@ class AccessMiddleware(BaseMiddleware):
         if not spec.group_allowed and ctx.chat_type in ("group", "supergroup"):
             raise UserError("这个指令只能在私聊里用")
         return await handler(event, data)
+
+
+class ChannelSyncMiddleware(BaseMiddleware):
+    """频道帖增量同步。
+
+    做成中间件而不是 handler，因为：
+      - channel_post 不是指令，没有 @command 元数据，走不了 wiring 那条路。
+      - 它必须在所有 handler 之前跑完，否则别的 router 可能先命中并 return。
+      - 频道帖不该经过限流和权限校验 —— 那两层是为用户指令设计的，
+        频道自己发的帖子没有"用户"也没有"配额"。
+
+    同步失败绝不能影响 update 继续往下走：一次解析异常不该让整条链断掉。
+    """
+
+    def __init__(self, sync: ChannelSync) -> None:
+        self._sync = sync
+
+    async def __call__(self, handler: Next, event: TelegramObject, data: dict[str, Any]) -> Any:
+        inner = event.event if isinstance(event, Update) else event
+        kind = _channel_post_kind(event, inner)
+        if kind is not None and isinstance(inner, Message):
+            try:
+                await self._sync.handle(inner, kind=kind)
+            except Exception:
+                # 吞掉：同步是旁路，不能拖垮主链路。异常带完整栈进日志。
+                log.exception("sync.crashed", message_id=inner.message_id)
+        return await handler(event, data)
+
+
+def _channel_post_kind(event: TelegramObject, inner: TelegramObject) -> str | None:
+    """区分 new / edited。不是频道帖返回 None。
+
+    优先看 Update 的字段名 —— 那是 Telegram 给出的权威分类。裸 Message
+    （测试里直接喂的）退回看 edit_date。
+    """
+    if isinstance(event, Update):
+        if event.channel_post is not None:
+            return "new"
+        if event.edited_channel_post is not None:
+            return "edited"
+        return None
+    if isinstance(inner, Message) and inner.chat.type == ChatType.CHANNEL:
+        return "edited" if inner.edit_date else "new"
+    return None

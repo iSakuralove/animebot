@@ -13,12 +13,15 @@ from . import handlers
 
 class SystemFeature(BaseFeature):
     name = "system"
-    requires = ("repo", "registry")
+    requires = ("repo", "registry", "sync")
 
     def router(self) -> Router:
         from ...bot.wiring import build_feature_router
 
         return build_feature_router(self, handlers, self.container.get("registry"))
+
+    def health(self) -> dict[str, object]:
+        return {"status": "ok", "commands": len(self.container.get("registry"))}
 
 
 FEATURE = SystemFeature

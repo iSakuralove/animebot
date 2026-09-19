@@ -7,10 +7,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -50,8 +50,11 @@ class Settings(BaseSettings):
     )
 
     # ---- 功能模块 ----
-    features: tuple[str, ...] = DEFAULT_FEATURES
-    admin_ids: tuple[int, ...] = ()
+    # NoDecode：这两个是 tuple（复杂类型），pydantic-settings 默认会先对 env 值
+    # 做 json.loads，"system,search" 不是合法 JSON 直接炸。NoDecode 关掉那步，
+    # 把裸字符串交给下面的 _split_csv 验证器按逗号拆。
+    features: Annotated[tuple[str, ...], NoDecode] = DEFAULT_FEATURES
+    admin_ids: Annotated[tuple[int, ...], NoDecode] = ()
 
     # ---- 存储 ----
     db_path: Path = ROOT / "data" / "animebot.db"
@@ -101,7 +104,10 @@ class Settings(BaseSettings):
     @field_validator("features", "admin_ids", mode="before")
     @classmethod
     def _split_csv(cls, v: object) -> object:
-        """支持 ANIMEBOT_FEATURES=system,search,bgm 这种写法。"""
+        """支持 ANIMEBOT_FEATURES=system,search,bgm 这种写法。
+
+        admin_ids 拆完还是 str 元组，交给 pydantic 把每个转成 int。
+        """
         if isinstance(v, str):
             return tuple(x.strip() for x in v.replace(";", ",").split(",") if x.strip())
         return v

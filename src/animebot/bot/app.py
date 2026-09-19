@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand, BotCommandScopeDefault
 
@@ -103,8 +104,13 @@ async def build_app(settings: Settings | None = None, *, with_bot: bool = True) 
                 "缺少 bot token。在 .env 里设 AnimeCoffeebot=<token>"
             )
 
+        # 直连被墙时走 http 代理。aiohttp 默认不读系统代理，必须显式传。
+        session = AiohttpSession(proxy=settings.proxy) if settings.proxy else None
+        if session is not None:
+            log.info("bot.proxy", proxy=settings.proxy)
         app.bot = Bot(
             token=token,
+            session=session,
             default=DefaultBotProperties(
                 parse_mode=ParseMode.HTML,
                 link_preview_is_disabled=True,

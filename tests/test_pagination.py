@@ -340,16 +340,13 @@ class TestRenderPage:
 
 
 class TestPageKeyboard:
-    async def test_no_nav_row_when_single_page(
+    async def test_single_page_no_keyboard(
         self, repo: PostRepo, search: SearchService
     ) -> None:
+        """单页结果没有任何按钮 —— 序号详情按钮已删，翻页行也不需要。"""
         await repo.upsert_many(many_posts(5))
         page = await search.search_page("测试番剧", page_size=8)
-        kb = page_keyboard(page, QueryStore())
-        assert kb is not None
-        flat = [b.text for row in kb.inline_keyboard for b in row]
-        assert "▶" not in flat
-        assert flat == ["1", "2", "3", "4", "5"]
+        assert page_keyboard(page, QueryStore()) is None
 
     async def test_nav_row_present_when_paged(
         self, repo: PostRepo, search: SearchService
@@ -358,6 +355,7 @@ class TestPageKeyboard:
         page = await search.search_page("测试番剧", page_size=8)
         kb = page_keyboard(page, QueryStore())
         assert kb is not None
+        assert len(kb.inline_keyboard) == 1, "只有翻页一行，没有序号按钮"
         nav = kb.inline_keyboard[-1]
         assert [b.text for b in nav] == ["·", "·", "1/4", "▶", "⏭"]
 
@@ -418,15 +416,15 @@ class TestPageKeyboard:
             assert b.callback_data, f"按钮 {b.text!r} 没有 callback_data"
         assert kb.inline_keyboard[-1][0].callback_data == NOOP
 
-    async def test_index_buttons_are_global(
+    async def test_no_index_buttons_only_nav(
         self, repo: PostRepo, search: SearchService
     ) -> None:
+        """序号按钮已删：键盘只剩翻页那一行。"""
         await repo.upsert_many(many_posts(25))
         page = await search.search_page("测试番剧", page=1, page_size=8)
         kb = page_keyboard(page, QueryStore())
         assert kb is not None
-        labels = [b.text for row in kb.inline_keyboard[:-1] for b in row]
-        assert labels == [str(i) for i in range(9, 17)]
+        assert len(kb.inline_keyboard) == 1, "不该再有序号按钮行"
 
     async def test_all_callback_data_within_limit(
         self, repo: PostRepo, search: SearchService
@@ -450,11 +448,13 @@ class TestPageKeyboard:
 
 
 class TestRenderDetail:
-    def test_highlights_terms(self, settings: Settings) -> None:
+    def test_highlights_terms(self) -> None:
+        """标题加粗行里命中词用下划线（bold-on-bold 看不出），正文里用加粗。"""
         p = make_post(1, "无职英雄", summary="一个无职之人的故事")
-        text = render_detail(p, settings, ["无职"])
-        assert text.count("<b>无职</b>") >= 2
+        text = render_detail(p, ["无职"])
+        assert "<u>无职</u>" in text, "标题里的命中词应下划线高亮"
+        assert "<b>无职</b>" in text, "正文里的命中词应加粗高亮"
 
-    def test_no_terms_still_escapes(self, settings: Settings) -> None:
+    def test_no_terms_still_escapes(self) -> None:
         p = make_post(1, "A & B")
-        assert "A &amp; B" in render_detail(p, settings)
+        assert "A &amp; B" in render_detail(p)

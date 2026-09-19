@@ -25,9 +25,8 @@ from dataclasses import dataclass
 # Telegram 的硬限制
 MAX_CALLBACK_BYTES = 64
 
-PREFIX_INLINE = "s"   # s:<page>:<query>   查询词直接编进去
-PREFIX_TOKEN = "t"    # t:<page>:<token>   查询词在 QueryStore 里
-PREFIX_DETAIL = "p"   # p:<message_id>     打开详情
+PREFIX_INLINE = "s"   # s:<page>:<query>       翻页，查询词直接编进去
+PREFIX_TOKEN = "t"    # t:<page>:<token>       翻页，查询词在 QueryStore 里
 NOOP = "x"            # 占位按钮（当前页、已到边界）
 
 

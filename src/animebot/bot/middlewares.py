@@ -31,11 +31,15 @@ _MAX_PAYLOAD_LOG = 120
 
 
 def _extract_command(text: str | None) -> tuple[str | None, str]:
-    """'/search 无职英雄@Bot' -> ('search', '无职英雄')"""
+    """'/s 无职英雄@Bot' -> ('s', '无职英雄')
+
+    不做 .lower()：指令大小写敏感，/s 和 /S 是两条不同指令。这里只是给 trace
+    和限流标个名，真正的路由在 aiogram 的 Command 过滤器（同样大小写敏感）。
+    """
     if not text or not text.startswith("/"):
         return None, ""
     head, _, tail = text.partition(" ")
-    name = head[1:].split("@", 1)[0].lower()
+    name = head[1:].split("@", 1)[0]
     return (name or None), tail.strip()
 
 

@@ -130,7 +130,12 @@ class CommandRegistry:
         self._order.append(spec)
 
     def get(self, name: str) -> CommandSpec | None:
-        return self._by_name.get(name.lstrip("/").lower())
+        """大小写敏感查找。/s 和 /S 是两条不同指令（/S 预留给特殊搜索）。
+
+        aiogram 的 Command 过滤器默认也是大小写敏感（ignore_case=False），
+        这里与之保持一致，否则 /help 能查到但真发指令时路由不到。
+        """
+        return self._by_name.get(name.lstrip("/"))
 
     def __iter__(self) -> Iterator[CommandSpec]:
         return iter(self._order)

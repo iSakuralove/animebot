@@ -67,6 +67,22 @@ class Post:
         parts = [self.title_cn, self.title_en, *self.aliases]
         return " ".join(p for p in parts if p)
 
+    @property
+    def direct_links(self) -> list[tuple[str, str, str]]:
+        """真实网盘直链，(kind, 展示名, url)。列表行行尾和详情主按钮用它。
+
+        逻辑在 domain.links.categorize（按 URL 主机判，不信标签）。放这里延迟 import
+        是为了不让 domain.post 反向依赖 domain.links 造成循环。
+        """
+        from .links import DIRECT, categorize
+        return categorize(self.links)[DIRECT]
+
+    @property
+    def index_links(self) -> list[tuple[str, str, str]]:
+        """跳转类链接：汇总表格、OD/CDN 节点。只在详情的次级区出现。"""
+        from .links import INDEX, categorize
+        return categorize(self.links)[INDEX]
+
     def permalink(self, username: str | None = None) -> str:
         """公开频道用 username 深链；否则退回 /c/ 内部链接（仅成员可见）。"""
         if username:

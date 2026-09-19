@@ -39,8 +39,9 @@ class Settings(BaseSettings):
     channel_id: int = 1702674582
     channel_username: str = "YXHMd"
     # 总开关：public -> t.me/YXHMd/<id>（任何人可点）
-    #        internal -> t.me/c/1702674582/<id>（仅频道成员可见）
-    link_mode: LinkMode = "public"
+    #        internal -> t.me/c/1702674582/<id>（仅频道成员可见，默认）
+    # 默认 internal：资源是频道福利，链接只对已加入频道的人有意义。
+    link_mode: LinkMode = "internal"
 
     # 全频道公用的番剧汇总表格，不入库到单条帖子，只在这里出现
     summary_sheet_url: str = (
@@ -66,6 +67,10 @@ class Settings(BaseSettings):
     fuzzy_min_score: int = Field(default=55, ge=0, le=100)
     # 超长查询词（>64 字节）的 LRU 暂存容量。丢了只会让翻页提示"搜索已过期"。
     query_store_size: int = Field(default=512, ge=16, le=10000)
+
+    # 连 api.telegram.org 的代理。空 = 直连。这台机器直连被墙，需要 http 代理。
+    # 例：ANIMEBOT_PROXY=http://127.0.0.1:7898
+    proxy: str = ""
 
     # ---- 外部 API（/bgm、/agent 之类都走这套）----
     http_timeout: float = Field(default=10.0, gt=0)

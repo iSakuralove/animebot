@@ -6,7 +6,7 @@ import html
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 
 from ..._util import command_arg
 from ...config import Settings
@@ -17,7 +17,6 @@ from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
 from ...search.callbacks import (
     NOOP,
-    PREFIX_DETAIL,
     PREFIX_INLINE,
     PREFIX_TOKEN,
     QueryStore,
@@ -25,6 +24,7 @@ from ...search.callbacks import (
 )
 from ...search.presenter import (
     detail_keyboard,
+    detail_preview,
     page_keyboard,
     render_detail,
     render_page,
@@ -34,21 +34,25 @@ from ...storage.repo import PostRepo
 
 log = get_logger("animebot.search")
 
+# 列表消息禁用链接预览：正文里有多条网盘直链，不禁的话 Telegram 会抓第一条
+# （通常是百度）弹一个大预览卡，把列表挤下去。详情反过来 —— 特意开预览显示头图。
+_NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
 
 @command(
-    "search",
+    "s",
     desc="搜索番剧",
-    usage="/search 无职英雄",
-    aliases=("s", "find"),
+    usage="/s 无职英雄",
+    aliases=("search", "find"),
     rate=(6, 20),
     long_help=(
         "支持多个关键词（空格分隔，命中越多排越前）、错别字容错、"
         "标签筛选。结果多于一页时下面会出现翻页按钮。\n\n"
         "例子:\n"
-        "/search 无职英雄\n"
-        "/search 咒术回站      （打错字也能搜到）\n"
-        "/search #奇幻 #异世界  （标签交集）\n"
-        "/search #百合 学园     （标签 + 关键词）"
+        "/s 无职英雄\n"
+        "/s 咒术回站      （打错字也能搜到）\n"
+        "/s #奇幻 #异世界  （标签交集）\n"
+        "/s #百合 学园     （标签 + 关键词）"
     ),
 )
 async def cmd_search(
@@ -60,7 +64,7 @@ async def cmd_search(
 ) -> None:
     query = command_arg(message)
     if not query:
-        raise UsageError("要搜什么？", "/search 无职英雄")
+        raise UsageError("要搜什么？", "/s 无职英雄")
 
     bind(query=query[:80])
     page = await search.search_page(query)
@@ -74,6 +78,7 @@ async def cmd_search(
     await message.reply(
         render_page(page, settings),
         reply_markup=page_keyboard(page, query_store),
+        link_preview_options=_NO_PREVIEW,
     )
 
 
@@ -101,9 +106,9 @@ async def cmd_check(
         return
     p = hit.post
     await message.reply(
-        f"✅ 发过 — <a href=\"{p.permalink(settings.link_username)}\">"
-        f"{html.escape(p.title_cn)}</a>",
+        render_detail(p),
         reply_markup=detail_keyboard(p, settings),
+        link_preview_options=detail_preview(p, settings),
     )
 
 
@@ -118,16 +123,31 @@ async def cmd_tags(message: Message, repo: PostRepo) -> None:
     await message.reply(f"<b>{title}</b>（共 {len(cloud)} 个）\n\n{body}")
 
 
+async def _safe_edit(callback: CallbackQuery, text: str, **kw: object) -> None:
+    """原地编辑并 answer。吞掉 "not modified"（重复点同一按钮），其余照抛。
+
+    编辑而不是发新消息：翻页和进出详情都在同一条消息上完成，聊天记录不会被
+    同一次搜索的十几个版本刷屏 —— 这是用户明确要的「就地修改」。
+    """
+    if callback.message is not None:
+        try:
+            await callback.message.edit_text(text, **kw)  # type: ignore[arg-type]
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+    await callback.answer()
+
+
 async def on_page(
     callback: CallbackQuery,
     search: SearchService,
     settings: Settings,
     query_store: QueryStore,
 ) -> None:
-    """翻页：原地编辑消息，不发新的。
+    """翻页，以及从详情点「返回」（返回按钮就是一个 encode_page）。
 
-    发新消息会让聊天记录被同一次搜索的十几个版本刷满。编辑是标准做法，
-    代价是要处理 "message is not modified"。
+    回到列表态必须禁用链接预览 —— 从带图详情返回时，不显式关掉的话上一条
+    详情的头图预览会残留。
     """
     ref = decode_page(callback.data or "", query_store)
     if ref is None:
@@ -139,47 +159,12 @@ async def on_page(
     page = await search.search_page(ref.query, page=ref.page)
     METRICS.incr("search.page_turn")
     bind(query=ref.query[:80], page=ref.page)
-
-    if callback.message is None:
-        await callback.answer()
-        return
-
-    try:
-        await callback.message.edit_text(
-            render_page(page, settings),
-            reply_markup=page_keyboard(page, query_store),
-        )
-    except TelegramBadRequest as exc:
-        # 内容完全没变时 Telegram 报这个。不是错误，用户重复点了同一页。
-        if "not modified" not in str(exc).lower():
-            raise
-    await callback.answer()
-
-
-async def on_detail(
-    callback: CallbackQuery,
-    repo: PostRepo,
-    settings: Settings,
-) -> None:
-    """结果列表里点序号 -> 出详情。callback_data 里只有 message_id。"""
-    raw = (callback.data or "").split(":", 1)
-    if len(raw) != 2 or not raw[1].isdigit():
-        await callback.answer("按钮已失效", show_alert=True)
-        return
-
-    post = await repo.get(settings.channel_id, int(raw[1]))
-    if post is None:
-        await callback.answer("这条帖子不在索引里了", show_alert=True)
-        return
-
-    METRICS.incr("search.detail_open")
-    if callback.message is not None:
-        # 详情作为新消息发出，保留原来的结果列表 —— 用户看完详情还要回去翻页
-        await callback.message.answer(
-            render_detail(post, settings),
-            reply_markup=detail_keyboard(post, settings),
-        )
-    await callback.answer()
+    await _safe_edit(
+        callback,
+        render_page(page, settings),
+        reply_markup=page_keyboard(page, query_store),
+        link_preview_options=_NO_PREVIEW,
+    )
 
 
 async def on_noop(callback: CallbackQuery) -> None:
@@ -188,8 +173,11 @@ async def on_noop(callback: CallbackQuery) -> None:
 
 
 def register_callbacks(router: Router) -> None:
-    """回调没有 @command 元数据，单独挂。"""
-    router.callback_query.register(on_detail, F.data.startswith(f"{PREFIX_DETAIL}:"))
+    """回调没有 @command 元数据，单独挂。
+
+    只剩翻页（s:/t:）和占位（x）。序号详情按钮已删 —— 标题超链接直接跳原帖，
+    不再需要 bot 自己渲染一份无图详情。
+    """
     router.callback_query.register(
         on_page,
         F.data.startswith(f"{PREFIX_INLINE}:") | F.data.startswith(f"{PREFIX_TOKEN}:"),

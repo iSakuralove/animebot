@@ -83,10 +83,14 @@ class TestRegistry:
         r.add(self._spec("search", aliases=("s", "find")))
         assert r.get("search") is r.get("s") is r.get("find")
 
-    def test_lookup_tolerates_slash_and_case(self) -> None:
+    def test_lookup_tolerates_slash_but_is_case_sensitive(self) -> None:
+        """去斜杠但大小写敏感：/s 和 /S 是两条不同指令（/S 预留给特殊搜索）。"""
         r = CommandRegistry()
-        r.add(self._spec("search"))
-        assert r.get("/SEARCH") is not None
+        r.add(self._spec("s"))
+        assert r.get("/s") is not None
+        assert r.get("s") is not None
+        assert r.get("/S") is None
+        assert r.get("S") is None
 
     def test_duplicate_rejected_at_startup(self) -> None:
         """重名指令必须启动期就炸，而不是运行时随机命中一个。"""

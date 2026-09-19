@@ -4,8 +4,8 @@
 这里测「callback_query 进了 Dispatcher 之后有没有走到 handler、有没有正确
 处理 Telegram 的报错」。
 
-这一层最容易漏的是**注册顺序**：翻页的前缀是 `s:`/`t:`，详情是 `p:`。
-过滤器写错的话点翻页会出详情，或者两个都不响应 —— 而这两种错都不抛异常。
+这一层最容易漏的是**过滤器串味**：翻页前缀是 `s:`/`t:`，详情是 `d:`/`D:`，
+NOOP 是 `x`。写错的话点翻页会走到详情、或两个都不响应 —— 而这两种错都不抛异常。
 """
 
 from __future__ import annotations
@@ -29,11 +29,15 @@ from aiogram.types import (
 from animebot.config import Settings
 from animebot.core.registry import CommandRegistry
 from animebot.features.search import handlers as search_handlers
-from animebot.search.callbacks import NOOP, QueryStore, encode_page
+from animebot.search.callbacks import (
+    NOOP,
+    QueryStore,
+    encode_page,
+)
 from animebot.search.service import SearchService
 from animebot.storage.repo import PostRepo
 
-from .conftest import CHANNEL_ID, make_post
+from .conftest import make_post
 
 USER_ID = 7001
 NOW = dt.datetime(2026, 9, 5, 12, 0, 0, tzinfo=dt.UTC)
@@ -254,43 +258,10 @@ async def test_noop_button_answered_silently(
     assert edits.alerts == []
 
 
-async def test_detail_button_not_caught_by_pager(
-    dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, edits: Edits
-) -> None:
-    """点详情要发新消息，不能编辑掉结果列表。过滤器写错这两个会串。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update("p:5"))
-    assert len(edits.new_messages) == 1
-    assert "测试番剧005" in edits.new_messages[0]
-    assert edits.edits == [], "详情把结果列表编辑掉了"
-
-
-async def test_page_button_not_caught_by_detail(
+async def test_page_button_edits_in_place(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
+    """翻页就地编辑，不发新消息。"""
     await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
     assert edits.new_messages == [], "翻页发了新消息而不是编辑"
     assert len(edits.edits) == 1
-
-
-async def test_detail_missing_post(
-    dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, edits: Edits
-) -> None:
-    await dp.feed_update(bot=fake_bot, update=cb_update("p:999999"))
-    assert len(edits.alerts) == 1
-    assert "不在索引" in edits.alerts[0]
-
-
-async def test_detail_malformed(
-    dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, edits: Edits
-) -> None:
-    await dp.feed_update(bot=fake_bot, update=cb_update("p:abc"))
-    assert len(edits.alerts) == 1
-    assert "失效" in edits.alerts[0]
-
-
-async def test_detail_uses_configured_channel(
-    dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, edits: Edits
-) -> None:
-    """详情按 (channel_id, message_id) 取，channel_id 来自配置。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update("p:5"))
-    assert str(CHANNEL_ID) in edits.new_messages[0] or "t.me/YXHMd/5" in edits.new_messages[0]

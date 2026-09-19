@@ -16,6 +16,8 @@
 | 某个模块的契约和坑 | [modules/](modules/) |
 | 怎么加一个新指令模块 | [adding_a_feature.md](adding_a_feature.md) |
 | 增量同步怎么设计的 | [design/incremental-sync.md](design/incremental-sync.md) |
+| 默认标题搜索怎么设计的 | [design/title-first-search.md](design/title-first-search.md) |
+| 检索层到 5 万帖时该换成什么（算法调研） | [design/search-optimization.md](design/search-optimization.md) |
 | 部署和监控 | [operations.md](operations.md) |
 
 ## 目录
@@ -40,7 +42,9 @@ docs/
 │   ├── bot.md                    aiogram 装配层
 │   └── ingest.md                 回填与增量同步
 └── design/                       具体功能的设计文档
-    └── incremental-sync.md
+    ├── incremental-sync.md
+    ├── title-first-search.md
+    └── search-optimization.md
 ```
 
 ## 写文档的规矩

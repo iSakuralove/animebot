@@ -11,6 +11,7 @@
 |---|---|
 | `post.py` | `Post` 模型 + `ParseStatus` |
 | `fields.py` | 字段别名表 + `normalize_key()` |
+| `links.py` | 资源链接分类（真实直链 vs 跳转表格/节点） |
 
 字段的完整清单和覆盖率见 [data-dictionary.md](../data-dictionary.md)，
 这里只讲契约和边界。
@@ -45,10 +46,16 @@ parse_status: ParseStatus = ParseStatus.OK
 | `key` | `(channel_id, message_id)` |
 | `search_title` | 中文名 + 英文名 + 别名拼一起，供 LIKE 预筛 |
 | `permalink(username)` | `username` 为 `None` 时退回 `t.me/c/<cid>/<id>` |
+| `direct_links` | 真实网盘直链 `[(kind, 展示名, url)]`，列表行尾 + 详情主按钮用 |
+| `index_links` | 跳转类（汇总表格 / OD 节点），只在详情次级区出现 |
 
 `permalink()` 接收 `username` 参数而不是读全局配置 —— 保持 domain 层对 config
 零依赖。调用方传 `settings.link_username`，那个属性会根据 `link_mode`
-返回用户名或 `None`。
+返回用户名或 `None`（**默认 internal，即返回 `None` 走 `/c/` 私有链接**，见
+[ADR-0011](../ADR/0011-proxy-and-internal-links.md)）。
+
+`direct_links` / `index_links` 延迟 import `links.categorize` —— 避免
+`post.py` 反向依赖 `links.py` 形成循环。分类逻辑见下。
 
 ### ParseStatus 的语义
 
@@ -123,6 +130,36 @@ normalize_key("アニメーション制作")  # 原样保留
 （`raw_text` 的 LIKE 已经能覆盖）。
 
 同理 `links` 是 dict，`tags` / `index_tags` 是关联表 —— 后两者要支持交集筛选。
+
+## links —— 资源链接分类
+
+### 按 URL 主机判，不信标签
+
+`Post.links` 是 `{kind: url}`，但 **kind 不可信**：真实数据里 `onedrive` 这个
+标签有 523 条实际指向 `docs.google.com`（2025 年起 up 主把 OneDrive 行写成了
+「打开表格」，指向全频道共用的汇总表）。同理 `od_node`/`cdn_node` 129 条全是
+`od.catimage.work` 的根地址 —— 一个落地页，不是某部番的深链。
+
+用户要的「真实链接」= 这条帖子自己的、能直接下载的网盘分享链接。所以判据落在
+**URL 指向哪里**，标签只是兜底：
+
+```
+classify_link(kind, url) ->
+  official               -> OFFICIAL
+  kind ∈ {sheet,od_node,cdn_node}  -> INDEX
+  host 含 docs.google.com          -> INDEX   (不管标签写的 onedrive 还是 sheet)
+  其余                             -> DIRECT
+```
+
+`drive.google.com`（gdrive 真实文件）**不**在 docs 之列 —— 它是直链。这一条
+消除了「onedrive 到底算不算真链接」这个特殊情况：host 是唯一裁判。
+
+### categorize 返回三组
+
+`categorize(links)` -> `{direct: [...], index: [...], official: [...]}`，每个元素
+`(kind, 展示名, url)`。三个键一定都在（可能是空 list），调用方不必判 KeyError。
+`direct` 组按 `_DIRECT_ORDER`（百度在前）排，展示名来自 `LINK_LABELS` —— 那是
+链接展示名的唯一真相来源，presenter 不再自己维护一份。
 
 ## 加新字段的流程
 

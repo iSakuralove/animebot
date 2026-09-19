@@ -29,7 +29,9 @@
 - `feature` 字段由 `bind_commands()` 在装配时填，装饰器里是空串
 - 重名（含别名冲突）在 `registry.add()` 里抛 `ConfigError` —— **启动期就炸**，
   不会变成「运行时随机命中一个」
-- `get()` 容忍前导斜杠和大小写：`get("/SEARCH")` 有效
+- `get()` 容忍前导斜杠但**大小写敏感**：`get("/s")` 命中，`get("/S")` 不命中
+  —— `/s` 和 `/S` 是两条不同指令（`/S` 预留给特殊搜索），与 aiogram 的 Command
+  过滤器默认（`ignore_case=False`）保持一致
 
 ### 谁读这张表
 

@@ -159,7 +159,9 @@ async def test_next_page_edits_message(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
     """翻页原地编辑，不发新消息 —— 否则聊天记录被同一次搜索刷满。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store, title_only=False))
+    )
     assert len(edits.edits) == 1
     assert edits.new_messages == []
     assert "第 2/4 页" in edits.edits[0]
@@ -170,7 +172,9 @@ async def test_keyboard_updated_on_turn(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
     """光换文字不换键盘的话，翻到末页后「下一页」还是亮的。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(3, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(3, "测试番剧", store, title_only=False))
+    )
     kb = edits.markups[0]
     assert kb is not None
     assert [b.text for b in kb.inline_keyboard[-1]] == ["⏮", "◀", "4/4", "·", "·"]
@@ -179,14 +183,18 @@ async def test_keyboard_updated_on_turn(
 async def test_jump_to_last(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(3, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(3, "测试番剧", store, title_only=False))
+    )
     assert "25" in edits.edits[0]
 
 
 async def test_jump_to_first(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(0, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(0, "测试番剧", store, title_only=False))
+    )
     assert "第 1/4 页" in edits.edits[0]
 
 
@@ -194,7 +202,9 @@ async def test_out_of_range_page_clamps(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
     """按钮是旧的、结果集变小了 —— 不该回一个空列表。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(99, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(99, "测试番剧", store, title_only=False))
+    )
     assert "第 4/4 页" in edits.edits[0]
 
 
@@ -202,7 +212,7 @@ async def test_long_query_via_token(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
     long_q = "英雄王，为了穷尽武道而转生～而后，成为世界最强的见习骑士♀～ 测试番剧"
-    data = encode_page(1, long_q, store)
+    data = encode_page(1, long_q, store, title_only=False)
     assert data.startswith("t:")
     await dp.feed_update(bot=fake_bot, update=cb_update(data))
     assert len(edits.edits) == 1
@@ -211,8 +221,12 @@ async def test_long_query_via_token(
 async def test_expired_token_tells_user(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, edits: Edits
 ) -> None:
-    """token 过期要有明确提示，不能静默失败也不能搜错东西。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update("t:1:deadbeef"))
+    """token 过期要有明确提示，不能静默失败也不能搜错东西。
+
+    用合法的 4 段格式（前缀:页:模式:token）但 token 不在 store 里，才是真的
+    「过期」；写成 3 段是「格式错」，走的是另一条分支。
+    """
+    await dp.feed_update(bot=fake_bot, update=cb_update("t:1:f:deadbeef"))
     assert edits.edits == []
     assert len(edits.alerts) == 1
     assert "过期" in edits.alerts[0]
@@ -223,7 +237,9 @@ async def test_not_modified_swallowed(
 ) -> None:
     """重复点同一页，Telegram 报 not modified。不是错误，不该冒泡。"""
     edits.edit_raises = bad_request("Bad Request: message is not modified")
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store, title_only=False))
+    )
     assert edits.answers == [""], "回调没被 answer，客户端会一直转圈"
 
 
@@ -234,14 +250,17 @@ async def test_other_bad_request_propagates(
     edits.edit_raises = bad_request("Bad Request: message to edit not found")
     with pytest.raises(TelegramBadRequest):
         await dp.feed_update(
-            bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store))
+            bot=fake_bot,
+            update=cb_update(encode_page(1, "测试番剧", store, title_only=False)),
         )
 
 
 async def test_callback_always_answered(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store, title_only=False))
+    )
     assert len(edits.answers) + len(edits.alerts) == 1
 
 
@@ -262,7 +281,9 @@ async def test_page_button_edits_in_place(
     dp: Dispatcher, fake_bot: Bot, seeded: PostRepo, store: QueryStore, edits: Edits
 ) -> None:
     """翻页就地编辑，不发新消息。"""
-    await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
+    await dp.feed_update(
+        bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store, title_only=False))
+    )
     assert edits.new_messages == [], "翻页发了新消息而不是编辑"
     assert len(edits.edits) == 1
 

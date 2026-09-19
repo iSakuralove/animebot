@@ -17,6 +17,7 @@ class SearchFeature(BaseFeature):
 
         router = build_feature_router(self, handlers, self.container.get("registry"))
         handlers.register_callbacks(router)
+        handlers.register_plain_search(router)
         return router
 
     def health(self) -> dict[str, object]:

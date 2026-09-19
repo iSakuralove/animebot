@@ -41,3 +41,4 @@
 | [0009](0009-single-instance-lock.md) | 单实例锁 + 409 快速失败 | 已接受，待实现 |
 | [0010](0010-pagination-state-in-callback-data.md) | 分页状态编进 callback_data | 已采纳 |
 | [0011](0011-proxy-and-internal-links.md) | 走代理连 Telegram，深链默认 internal | 已采纳 |
+| [0012](0012-title-first-search.md) | 默认搜标题，全文只在标题零命中时回退 | 已采纳 |

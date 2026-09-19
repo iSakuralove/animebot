@@ -14,6 +14,10 @@ Telegram 的 callback_data 上限是 **64 字节**（UTF-8 编码后），不是
 进程内存表。这条路径冷，所以必须有测试盯着，否则等真有人粘贴长标题时才发现。
 
 两种形态共用一个 decode()，调用方不需要知道用了哪种。
+
+**模式位**：callback_data 里带一位 title_only 标志（`t`=标题模式 / `f`=全文模式）。
+翻页时按原模式重查，否则用 /s（全文）搜出来的结果翻页会被当标题模式重查，
+结果集变了、翻页串位。多这 2 字节，token 形态仍远在 64 字节内。
 """
 
 from __future__ import annotations
@@ -25,15 +29,19 @@ from dataclasses import dataclass
 # Telegram 的硬限制
 MAX_CALLBACK_BYTES = 64
 
-PREFIX_INLINE = "s"   # s:<page>:<query>       翻页，查询词直接编进去
-PREFIX_TOKEN = "t"    # t:<page>:<token>       翻页，查询词在 QueryStore 里
+PREFIX_INLINE = "s"   # s:<page>:<mode>:<query>   翻页，查询词直接编进去
+PREFIX_TOKEN = "t"    # t:<page>:<mode>:<token>   翻页，查询词在 QueryStore 里
 NOOP = "x"            # 占位按钮（当前页、已到边界）
+
+_MODE_TITLE = "t"     # 标题模式（纯文本入口，只搜标题）
+_MODE_FULL = "f"      # 全文模式（/s 入口，标题优先、零命中回退全文）
 
 
 @dataclass(frozen=True, slots=True)
 class PageRef:
     page: int
     query: str
+    title_only: bool
 
 
 class QueryStore:
@@ -69,26 +77,28 @@ class QueryStore:
         return len(self._items)
 
 
-def encode_page(page: int, query: str, store: QueryStore) -> str:
-    """page + query -> callback_data。塞得下就内联，塞不下就存表给 token。"""
-    inline = f"{PREFIX_INLINE}:{page}:{query}"
+def encode_page(page: int, query: str, store: QueryStore, *, title_only: bool) -> str:
+    """page + query + 模式 -> callback_data。塞得下就内联，塞不下就存表给 token。"""
+    mode = _MODE_TITLE if title_only else _MODE_FULL
+    inline = f"{PREFIX_INLINE}:{page}:{mode}:{query}"
     if len(inline.encode()) <= MAX_CALLBACK_BYTES:
         return inline
-    return f"{PREFIX_TOKEN}:{page}:{store.put(query)}"
+    return f"{PREFIX_TOKEN}:{page}:{mode}:{store.put(query)}"
 
 
 def decode_page(data: str, store: QueryStore) -> PageRef | None:
-    """callback_data -> page + query。token 过期或格式不对返回 None。"""
-    parts = data.split(":", 2)
-    if len(parts) != 3:
+    """callback_data -> page + query + 模式。token 过期或格式不对返回 None。"""
+    parts = data.split(":", 3)
+    if len(parts) != 4:
         return None
-    kind, raw_page, tail = parts
-    if not raw_page.isdigit():
+    kind, raw_page, mode, tail = parts
+    if not raw_page.isdigit() or mode not in (_MODE_TITLE, _MODE_FULL):
         return None
     page = int(raw_page)
+    title_only = mode == _MODE_TITLE
     if kind == PREFIX_INLINE:
-        return PageRef(page=page, query=tail) if tail else None
+        return PageRef(page=page, query=tail, title_only=title_only) if tail else None
     if kind == PREFIX_TOKEN:
         query = store.get(tail)
-        return PageRef(page=page, query=query) if query else None
+        return PageRef(page=page, query=query, title_only=title_only) if query else None
     return None

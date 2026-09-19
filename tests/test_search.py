@@ -146,6 +146,90 @@ class TestSearchService:
         assert len(hits) == 3
 
 
+class TestTitleMode:
+    """默认标题搜索 + 全文回退。这批盯的是「标题命中绝不混全文」这条铁律。"""
+
+    async def test_title_only_ignores_body_match(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """title_only=True：term 只在正文（导演名）里，不该命中。"""
+        await repo.upsert_many([
+            make_post(1, "某动画", raw_text="导演: 山田尚子"),
+        ])
+        hits = await search.search("山田尚子", title_only=True)
+        # 标题域零命中 → 走 fuzzy 纠错，但绝不会给出 body 命中
+        assert all(h.reason != "body" for h in hits)
+
+    async def test_fulltext_finds_body_match(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """title_only=False（/s）：标题零命中才回退正文，能靠导演名找到。"""
+        await repo.upsert_many([
+            make_post(1, "某动画", raw_text="导演: 山田尚子"),
+        ])
+        hits = await search.search("山田尚子", title_only=False)
+        assert hits
+        assert hits[0].reason == "body"
+
+    async def test_title_hit_never_mixes_body(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """核心：一个词既有标题命中又有正文命中时，全文模式也只返回标题命中。
+
+        这是拆隐式级联的意义所在 —— 旧代码「标题不足一页就扩全文」会把正文命中
+        混进来撑多结果、触发翻页。
+        """
+        await repo.upsert_many([
+            make_post(1, "青春猪头少年"),                       # 标题命中
+            make_post(2, "别的番", raw_text="讲一个青春的故事"),  # 只正文提到
+        ])
+        hits = await search.search("青春", title_only=False)
+        ids = {h.post.message_id for h in hits}
+        assert ids == {1}, "标题有命中时，正文命中不该混进来"
+
+    async def test_fallback_flag_set_only_on_body_fallback(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """fell_back 标记：标题命中时 False，回退正文时 True。presenter 靠它打提示。"""
+        await repo.upsert_many([
+            make_post(1, "青春猪头少年"),
+            make_post(2, "某动画", raw_text="导演: 山田尚子"),
+        ])
+        title_hit = await search.search_page("青春", title_only=False)
+        assert title_hit.fallback is False
+
+        body_hit = await search.search_page("山田尚子", title_only=False)
+        assert body_hit.fallback is True
+
+    async def test_title_mode_never_falls_back(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """title_only=True 永远不回退全文，fallback 恒 False。"""
+        await repo.upsert_many([
+            make_post(1, "某动画", raw_text="导演: 山田尚子"),
+        ])
+        page = await search.search_page("山田尚子", title_only=True)
+        assert page.fallback is False
+
+    async def test_title_mode_still_fuzzy_corrects(
+        self, repo: PostRepo, search: SearchService, sample_posts: list[Post]
+    ) -> None:
+        """标题模式零命中仍走 fuzzy 纠错（纠错在标题域，不算回退）。"""
+        await repo.upsert_many(sample_posts)
+        hits = await search.search("咒术回站", title_only=True)
+        assert hits
+        assert hits[0].post.title_cn == "咒术回战"
+        assert hits[0].reason == "fuzzy"
+
+    async def test_page_carries_title_only(
+        self, repo: PostRepo, search: SearchService
+    ) -> None:
+        """SearchPage 记住模式 —— 翻页 callback 靠它编码，翻页时结果集才不变。"""
+        await repo.upsert_many([make_post(i, f"青春{i:03d}") for i in range(1, 30)])
+        page = await search.search_page("青春", title_only=True)
+        assert page.title_only is True
+
+
 class TestPermalink:
     def test_public_mode(self, settings: Settings) -> None:
         p = make_post(3948, "某番")

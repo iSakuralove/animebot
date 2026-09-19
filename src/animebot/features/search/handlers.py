@@ -13,7 +13,7 @@ from ..._util import command_arg
 from ...config import Settings
 from ...core.errors import NotFound, UsageError
 from ...core.registry import command
-from ...observability.context import RequestContext, bind
+from ...observability.context import bind
 from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
 from ...search.callbacks import (
@@ -60,18 +60,47 @@ async def cmd_search(
     message: Message,
     search: SearchService,
     settings: Settings,
-    trace: RequestContext,
     query_store: QueryStore,
 ) -> None:
     query = command_arg(message)
     if not query:
         raise UsageError("要搜什么？", "/s 无职英雄")
+    # /s 走全文模式：标题优先，标题零命中才回退全文（带提示）。
+    await _reply_search(message, query, search, settings, query_store, title_only=False)
 
+
+async def on_plain_text(
+    message: Message,
+    search: SearchService,
+    settings: Settings,
+    query_store: QueryStore,
+) -> None:
+    """私聊里的纯文本 = 标题搜索。只在私聊注册（见 register_plain_search）。
+
+    标题命中天然少，一条消息装得下、不翻页、只一次 Telegram 往返 —— 这才是
+    用户要的「一点即达」手感。零命中走 fuzzy 纠错，仍在标题域，不回退全文。
+    """
+    query = (message.text or "").strip()
+    if not query:   # 过滤器已挡掉无文本消息，这里只是防御
+        return
+    await _reply_search(message, query, search, settings, query_store, title_only=True)
+
+
+async def _reply_search(
+    message: Message,
+    query: str,
+    search: SearchService,
+    settings: Settings,
+    query_store: QueryStore,
+    *,
+    title_only: bool,
+) -> None:
+    """两个入口的共同主体。差别只在查询词来源和 title_only，逻辑一份。"""
     bind(query=query[:80])
-    page = await search.search_page(query)
+    page = await search.search_page(query, title_only=title_only)
     METRICS.incr("search.query", found=not page.is_empty)
     METRICS.observe("search.results", page.total)
-    trace.bind(
+    bind(
         result_count=page.total,
         reason=page.hits[0].reason if page.hits else "none",
     )
@@ -173,7 +202,10 @@ async def on_page(
         METRICS.incr("search.page_expired")
         return
 
-    page = await search.search_page(ref.query, page=ref.page)
+    # 按原模式重查：全文模式的翻页不能被当标题模式重搜，否则结果集变、翻页串。
+    page = await search.search_page(
+        ref.query, page=ref.page, title_only=ref.title_only
+    )
     METRICS.incr("search.page_turn")
     bind(query=ref.query[:80], page=ref.page)
     await _safe_edit(
@@ -200,3 +232,19 @@ def register_callbacks(router: Router) -> None:
         F.data.startswith(f"{PREFIX_INLINE}:") | F.data.startswith(f"{PREFIX_TOKEN}:"),
     )
     router.callback_query.register(on_noop, F.data == NOOP)
+
+
+def register_plain_search(router: Router) -> None:
+    """私聊纯文本 = 标题搜索。也没有 @command 元数据，单独挂。
+
+    三个过滤器缺一不可：
+    - `F.chat.type == "private"`：只在私聊。群里 catch 所有消息会把每句闲聊
+      当搜索，是灾难 —— 群里搜索必须显式 /s。
+    - `F.text`：挡掉图片/贴纸等无文本消息（magic_filter 对 None 返回 falsy）。
+    - `~F.text.startswith("/")`：不抢指令。/s 等由 Command 过滤器先接走。
+    """
+    router.message.register(
+        on_plain_text,
+        F.chat.type == "private",
+        F.text & ~F.text.startswith("/"),
+    )

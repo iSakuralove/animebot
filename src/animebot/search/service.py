@@ -9,6 +9,7 @@ rapidfuzz 对 1447 个标题模糊排序 10ms。所以这里就是 LIKE 预筛 +
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz, process
@@ -16,6 +17,9 @@ from rapidfuzz import fuzz, process
 from ..config import Settings
 from ..domain.post import Post
 from ..storage.repo import PostRepo
+
+# repo.like_titles / like_fulltext 的共同签名：候选来源在两种模式间只此一变。
+_Lookup = Callable[[str, int], Awaitable[list[Post]]]
 
 _HASHTAG = re.compile(r"#([0-9A-Za-z_一-鿿぀-ヿー]+)")
 
@@ -50,6 +54,8 @@ class SearchPage:
     total: int                # 全部命中数
     page: int                 # 0-based
     page_size: int
+    title_only: bool = False  # 检索模式：翻页时按它重查，否则结果集会变
+    fallback: bool = False    # 标题零命中、回退了全文；presenter 靠它决定是否打提示行
 
     @property
     def pages(self) -> int:
@@ -134,13 +140,21 @@ class SearchService:
         self._repo = repo
         self._cfg = settings
 
-    async def search(self, raw: str, limit: int | None = None) -> list[SearchHit]:
-        """取前 N 条。`/check` 和 CLI 用它，不需要知道分页。"""
-        page = await self.search_page(raw, page_size=limit or self._cfg.search_page_size)
+    async def search(
+        self, raw: str, limit: int | None = None, *, title_only: bool = False
+    ) -> list[SearchHit]:
+        """取前 N 条。`/check` 和 CLI 用它，不需要知道分页。
+
+        默认 `title_only=False`：`/check` 该能靠简介找到，CLI 行为不变。
+        """
+        page = await self.search_page(
+            raw, page_size=limit or self._cfg.search_page_size, title_only=title_only
+        )
         return page.hits
 
     async def search_page(
-        self, raw: str, *, page: int = 0, page_size: int | None = None
+        self, raw: str, *, page: int = 0, page_size: int | None = None,
+        title_only: bool = False,
     ) -> SearchPage:
         """分页检索。
 
@@ -149,10 +163,11 @@ class SearchService:
         以及「翻页时帖子被编辑了」的一致性问题。省下 10ms 不值这些复杂度。
 
         排序是确定性的（`sort_key` 是全序），所以重新查得到的顺序完全一致，
-        翻页不会出现重复或漏项。
+        翻页不会出现重复或漏项 —— 前提是 `title_only` 不变，所以它编进了翻页
+        callback，翻页时原样传回来。
         """
         size = page_size or self._cfg.search_page_size
-        ranked = await self._rank_all(raw)
+        ranked, fell_back = await self._rank_all(raw, title_only=title_only)
         total = len(ranked)
         # 越界的页码夹回最后一页，而不是返回空 —— 用户点了「末页」之后再点「下一页」
         # 不该看到空列表。
@@ -165,32 +180,66 @@ class SearchService:
             total=total,
             page=page,
             page_size=size,
+            title_only=title_only,
+            fallback=fell_back,
         )
 
-    async def _rank_all(self, raw: str) -> list[SearchHit]:
-        """完整的候选集，已排序。分页只是对它切片。"""
-        q = Query.parse(raw)
-        cap = self._cfg.search_max_candidates
+    async def _rank_all(
+        self, raw: str, *, title_only: bool
+    ) -> tuple[list[SearchHit], bool]:
+        """完整的候选集（已排序）+ 是否回退了全文。分页只是对它切片。
 
-        # 纯标签查询
+        两种模式共用一套「取候选→打分→模糊兜底→标签过滤→排序」，只差候选来源：
+
+        - 标题优先：先只搜标题（search_blob = 中文名+英文名+别名）。有命中就返回，
+          绝不混入正文命中 —— 这是把旧代码「标题不足一页就自动扩全文」的隐式级联
+          拆掉的关键，那个级联会让「青春」的 3 条标题命中被几十条简介命中淹没。
+        - 标题零命中时分叉：`title_only`（纯文本入口）走模糊纠错，仍在标题域；
+          否则（`/s` 入口）才回退全文，并把 `fell_back` 标出来给提示行。
+        """
+        q = Query.parse(raw)
+
+        # 纯标签查询：候选就是结果，保持 posted_at DESC 顺序，不打分不排序。
         if q.tags and not q.terms:
+            cap = self._cfg.search_max_candidates
             posts = await self._repo.by_tags(q.tags, limit=cap)
-            return [SearchHit(p, 0.0, 0, "tag") for p in posts]
+            return [SearchHit(p, 0.0, 0, "tag") for p in posts], False
 
         if not q.terms:
-            return []
+            return [], False
 
-        # 逐词取候选，并集。整串 LIKE 对多词查询是废的。
+        # 第一路：只搜标题。标签过滤在判空之前 —— 标题命中被标签滤光时，
+        # 才等价于「标题没有真正的命中」，全文模式应当继续回退，不是空手而归。
+        title_hits = await self._ranked_over(q, self._repo.like_titles)
+        if title_hits:
+            return title_hits, False
+
+        # 标题零命中。标题模式到此为止，退模糊纠错（不碰全文）。
+        if title_only:
+            return self._finalize(
+                await self._fuzzy(q.text.lower(), self._cfg.search_page_size), q
+            ), False
+
+        # 全文模式：回退正文。
+        body_hits = await self._ranked_over(q, self._repo.like_fulltext)
+        if body_hits:
+            return body_hits, True
+
+        # 全文也零命中，最后退模糊纠错。fuzzy 是标题域纠错，不算全文回退。
+        return self._finalize(
+            await self._fuzzy(q.text.lower(), self._cfg.search_page_size), q
+        ), False
+
+    async def _ranked_over(self, q: Query, lookup: _Lookup) -> list[SearchHit]:
+        """用 `lookup`（like_titles 或 like_fulltext）取候选、打分、过滤、排序。
+
+        逐词取候选、并集：整串 LIKE '%无职英雄 技能%' 命中 0，逐词才各命中。
+        """
+        cap = self._cfg.search_max_candidates
         cand: dict[tuple[int, int], Post] = {}
         for term in q.terms:
-            for p in await self._repo.like_titles(term, cap):
+            for p in await lookup(term, cap):
                 cand.setdefault(p.key, p)
-        # 标题候选不足一页就扩到正文。用固定阈值而不是 limit：分页时 limit 是
-        # 页大小，不该因为翻到第 3 页就改变候选集的构成。
-        if len(cand) < self._cfg.search_page_size:
-            for term in q.terms:
-                for p in await self._repo.like_fulltext(term, cap):
-                    cand.setdefault(p.key, p)
 
         terms_lower = [t.lower() for t in q.terms]
         hits: list[SearchHit] = []
@@ -198,14 +247,13 @@ class SearchService:
             score, n, reason = rank_terms(p, terms_lower)
             if n:
                 hits.append(SearchHit(p, score, n, reason))
+        return self._finalize(hits, q)
 
-        if not hits:   # 可能打错字，退到模糊匹配
-            hits = await self._fuzzy(q.text.lower(), self._cfg.search_page_size)
-
+    def _finalize(self, hits: list[SearchHit], q: Query) -> list[SearchHit]:
+        """标签过滤 + 排序。所有返回结果的共同收尾。"""
         if q.tags:     # 标签当过滤器用
             want = set(q.tags)
             hits = [h for h in hits if want <= set(h.post.tags)]
-
         hits.sort(key=lambda h: h.sort_key)
         return hits
 

@@ -265,3 +265,49 @@ async def test_page_button_edits_in_place(
     await dp.feed_update(bot=fake_bot, update=cb_update(encode_page(1, "测试番剧", store)))
     assert edits.new_messages == [], "翻页发了新消息而不是编辑"
     assert len(edits.edits) == 1
+
+
+# ---------------------------------------------------------------- _safe_edit 真实对象
+
+
+async def test_safe_edit_uses_real_shortcut_methods(
+    fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归：_safe_edit 必须能吃 aiogram 的真 shortcut 方法。
+
+    上面那些测试把 CallbackQuery.answer / Message.edit_text 换成了 async def 假货，
+    于是 asyncio.gather 拿到的是普通 coroutine，永远不会触发真 bug。
+
+    真实的 .answer()/.edit_text() 返回的是 TelegramMethod 对象（pydantic model，
+    可 await 但不是 coroutine，且无 __hash__）。曾经直接把它塞进 gather →
+    "unhashable type: 'AnswerCallbackQuery'"，线上每次翻页都崩。
+
+    这里只 fake 会话层的网络调用（bot(...)），保留真 shortcut，复现那条路径。
+    """
+    from animebot.features.search.handlers import _safe_edit
+
+    calls: list[str] = []
+
+    async def fake_call(self: Bot, method: object, **_kw: object) -> object:
+        # 只记录被调用的方法类型，吃掉 timeout 等关键字参数
+        calls.append(type(method).__name__)
+        return True
+
+    monkeypatch.setattr(type(fake_bot), "__call__", fake_call, raising=True)
+
+    msg = Message(
+        message_id=100, date=NOW,
+        chat=Chat(id=USER_ID, type="private"), text="旧",
+    ).as_(fake_bot)
+    cb = CallbackQuery(
+        id="cb1",
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        chat_instance="ci",
+        data="s:0:x",
+        message=msg,
+    ).as_(fake_bot)
+
+    # 不该抛 unhashable，且两个 API 都真的发了
+    await _safe_edit(cb, "新内容")
+    assert "AnswerCallbackQuery" in calls
+    assert "EditMessageText" in calls

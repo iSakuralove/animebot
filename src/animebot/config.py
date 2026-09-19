@@ -82,7 +82,9 @@ class Settings(BaseSettings):
     log_json: bool = False          # 控制台是否也输出 JSON；文件永远是 JSON
     log_dir: Path = ROOT / "logs"
     telemetry_enabled: bool = True
-    slow_command_ms: float = 1500.0  # 超过就打 warning，便于抓慢指令
+    # 超过就打 warning。设 5000 是因为走代理时每次 API 往返 2~3s 是常态，
+    # 1500 会把每条正常翻页都误报成慢查询、刷满日志。直连部署后可以调回 1500。
+    slow_command_ms: float = 5000.0
 
     @field_validator("channel_id")
     @classmethod

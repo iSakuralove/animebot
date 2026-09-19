@@ -20,9 +20,13 @@ uv run python -m animebot run
 | `app.ready` | 数据库连上，报告帖子数 |
 | `bot.commands_synced` | 指令菜单已推给 Telegram |
 | `bot.start` | 拿到 `getMe`，token 有效 |
+| `bot.proxy` | 走了代理（`ANIMEBOT_PROXY` 非空时）|
 | `preflight.channel_ok` | bot 在频道里是管理员 |
 | `preflight.channel_unreachable` | **增量同步不会工作** |
 | `preflight.username_mismatch` | 深链会指向错误的频道 |
+
+启动阶段的 `getMe`/`setMyCommands`/`preflight` 三次 API 调用顺带把到 Telegram 的
+连接预热好了 —— 用户第一次翻页不用再吃一次冷启动建连（实测 ~2000ms）。
 
 ## 部署前必须做的两件事
 
@@ -111,6 +115,58 @@ Uptime Kuma / 哪吒探针盯服务器的 HTTP/TCP 层。这一层跟 bot 无关
 网络到 Telegram 断了，那告警也发不出去。
 
 备用通道用 ntfy 或邮件。
+
+## 性能：翻页慢是网络，不是代码
+
+反复被问「为什么翻页慢，之前很快」。实测结论钉在这里，省得下次再纠结。
+
+### 成本分解
+
+一次翻页 = 本地检索 + 一次 `editMessageText` 往返：
+
+| 环节 | 耗时 | 能不能改 |
+|---|---|---|
+| 检索（LIKE + 排序 + 分页） | ~28ms（最坏 `#漫改` 574 条） | 已是地板，不用改 |
+| `editMessageText` 一次往返 | **~350ms** | 改不了，物理延迟 |
+| 首次建连（TLS + 代理隧道） | ~2000ms，**一次性** | 启动预热已消除 |
+
+所以稳态翻页 ≈ **380ms**。之前日志里出现的 2243ms 是冷启动第一次撞上建连。
+
+### 那 350ms 是什么，为什么改不掉
+
+实测 `getMe` 连续 5 次：首次 ~1700ms（建连），之后稳定 ~350ms（复用连接）。
+这 350ms 是**本机到 Telegram 服务器（欧洲/新加坡）的物理往返**。
+
+关键实测：**直连和走代理几乎一样**（直连 354ms / 代理 348ms）。而且这台机器
+DNS 把 `api.telegram.org` 解析到 `198.18.0.35`（代理软件的 fake-ip），说明所谓
+「直连」其实也被本地代理接管了。**去掉 `ANIMEBOT_PROXY` 不会让它变快。**
+
+### 为什么「之前一点即达」
+
+不是代码退化，是交互模型变了：
+
+- 老架构：搜索 = 发一条静态消息，发完结束 = 一次往返。
+- 现在：翻页 / 返回 = 每次再发一次 `editMessageText` = 每次一个 350ms 往返。
+
+多了功能，每个功能都要过一次网络。这是新增交互的固有成本。
+
+### 代码层面做过的两个优化
+
+1. **启动预热**：见「启动」节，消除首次翻页的 ~2000ms 建连。
+2. **`answer()` + `edit_text()` 并发**（`_safe_edit` 里的 `asyncio.gather`）：
+   两个 API 无依赖，串行 700ms → 并发 350ms，省一整个往返，转圈也立刻停。
+   注意：aiogram 的 `.answer()` 返回 TelegramMethod 对象（不是 coroutine），
+   **必须先包成 coroutine 再进 gather**，否则 `unhashable type` 每次翻页必崩。
+   回归测试 `test_safe_edit_uses_real_shortcut_methods` 盯着这条。
+
+### 真正的解法：部署到能直连的海外 VPS
+
+350ms 的地板只有换网络位置能打破。bot 跑在贴近 Telegram 服务器的海外 VPS 上，
+往返回到 50~100ms，翻页才是真正的「一点即达」。在校园网 / 家宽本地跑，350ms
+是物理下限，代码到头了。
+
+部署后记得把 `slow_command_ms` 从 5000 调回 1500 —— 那个 5000 是迁就代理往返的，
+直连环境下 1500 才能正常抓慢查询。
 
 ## 日常排查
 

@@ -221,6 +221,20 @@ class TestTitleMode:
         assert hits[0].post.title_cn == "咒术回战"
         assert hits[0].reason == "fuzzy"
 
+    async def test_sticky_one_char_returns_nothing(
+        self, repo: PostRepo, search: SearchService, sample_posts: list[Post]
+    ) -> None:
+        """回归：只沾一个字的词不该被 fuzzy 凑出「相关但不匹配」的结果。
+
+        『战争』只和『咒术回战』共享一个「战」字，WRatio 在旧阈值 55 下会误命中，
+        凑出一屏噪音——违反「不指定指令只返回真匹配标题」的铁律。fuzzy_min_score
+        提到 65 后必须归零。别把阈值调回 55，否则「天下」那个 bug 复活。
+        """
+        await repo.upsert_many(sample_posts)
+        page = await search.search_page("战争", title_only=True)
+        assert page.total == 0, f"沾一个字不该命中，却返回了 {page.total} 条"
+        assert page.is_empty
+
     async def test_page_carries_title_only(
         self, repo: PostRepo, search: SearchService
     ) -> None:

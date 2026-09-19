@@ -64,7 +64,10 @@ class Settings(BaseSettings):
     # 实测最坏情况（#漫改，572 条全排序）34ms，远在 100ms 目标内。
     # 全库到 ~5 万条时这个数要重新评估，届时该换的是倒排索引而不是调大它。
     search_max_candidates: int = Field(default=3000, ge=20, le=50000)
-    fuzzy_min_score: int = Field(default=55, ge=0, le=100)
+    # 65 是实测分界线：「天下」顶格 60 分（只沾一个字，是噪音），而「咒术回站」
+    # →咒术回战 75 分、「无值英雄」→无职英雄 67.5 分（真错字）。55 会把「天下」
+    # 凑出 17 条相关但不匹配的垃圾，违反「不指定指令只返回真匹配」的业务铁律。
+    fuzzy_min_score: int = Field(default=65, ge=0, le=100)
     # 超长查询词（>64 字节）的 LRU 暂存容量。丢了只会让翻页提示"搜索已过期"。
     query_store_size: int = Field(default=512, ge=16, le=10000)
 

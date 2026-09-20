@@ -24,9 +24,10 @@ bot 跑在 VPS 上（直连 Telegram，比本地走代理快一倍）。**不要
 本地和线上用同一个 token，两处 `getUpdates` 会 409 互踢，各拿一半消息，两边都坏。
 
 - 要真机验证：改完 push，在 VPS 上 `git pull` + 重启，看 `journalctl`。
-- 要先停线上：VPS 上 `systemctl stop animebot`。**停 bot 是运维动作，不做成
-  Telegram 指令** —— 那等于给聊天窗口一个单点关停开关，一个人停掉全频道就用不了了。
-- 具体 SSH / systemd 命令见 `CLAUDE.local.md`。
+- 停 / 重启 / 看日志：从自己电脑一条 `ssh <vps> 'systemctl stop|restart|status animebot'`
+  即可。**停 bot 是运维动作，不做成 Telegram 指令** —— 那等于给聊天窗口一个单点
+  关停开关，一个人停掉全频道就用不了了。
+- 带 IP 的具体 SSH / systemctl / 更新命令见 `CLAUDE.local.md`（gitignored，不进公开仓库）。
 
 pytest 是纯本地的（用 `feed_update` 手搓 Update，不连 Telegram），本地随便跑。
 只有「真机行为」这类验证才必须上 VPS。

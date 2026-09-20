@@ -27,7 +27,7 @@ from animebot.search.presenter import (
     render_detail,
     render_page,
 )
-from animebot.search.service import SearchHit, SearchPage, SearchService
+from animebot.search.service import SearchService
 from animebot.storage.repo import PostRepo
 
 from .conftest import make_post
@@ -100,13 +100,13 @@ class TestHighlight:
 class TestCallbackCodec:
     def test_short_query_inlined(self) -> None:
         store = QueryStore()
-        data = encode_page(2, "无职英雄", store, title_only=False)
+        data = encode_page(2, "无职英雄", store, strict=False)
         assert data.startswith(f"{PREFIX_INLINE}:")
         assert len(store) == 0, "短查询词不该占用暂存"
 
     def test_roundtrip_inline(self) -> None:
         store = QueryStore()
-        ref = decode_page(encode_page(3, "#奇幻 无职英雄", store, title_only=False), store)
+        ref = decode_page(encode_page(3, "#奇幻 无职英雄", store, strict=False), store)
         assert ref is not None
         assert ref.page == 3
         assert ref.query == "#奇幻 无职英雄"
@@ -119,80 +119,80 @@ class TestCallbackCodec:
         """
         store = QueryStore()
         q = "Re:从零开始:测试"
-        ref = decode_page(encode_page(1, q, store, title_only=False), store)
+        ref = decode_page(encode_page(1, q, store, strict=False), store)
         assert ref is not None
         assert ref.query == q
 
     def test_long_query_uses_token(self) -> None:
         store = QueryStore()
-        data = encode_page(0, LONG_TITLE, store, title_only=False)
+        data = encode_page(0, LONG_TITLE, store, strict=False)
         assert data.startswith(f"{PREFIX_TOKEN}:")
         assert len(data.encode()) <= MAX_CALLBACK_BYTES
         assert len(store) == 1
 
     def test_roundtrip_token(self) -> None:
         store = QueryStore()
-        ref = decode_page(encode_page(5, LONG_TITLE, store, title_only=False), store)
+        ref = decode_page(encode_page(5, LONG_TITLE, store, strict=False), store)
         assert ref is not None
         assert ref.page == 5
         assert ref.query == LONG_TITLE
 
     def test_mode_bit_roundtrips_inline(self) -> None:
-        """模式位必须原样往返 —— 否则 /s 全文翻页会被当标题模式重查、结果集变。"""
+        """模式位必须原样往返 —— 否则 /s 严谨翻页会被当宽松模式重查、结果集变。"""
         store = QueryStore()
-        title = decode_page(encode_page(1, "青春", store, title_only=True), store)
-        full = decode_page(encode_page(1, "青春", store, title_only=False), store)
-        assert title is not None and title.title_only is True
-        assert full is not None and full.title_only is False
+        strict = decode_page(encode_page(1, "青春", store, strict=True), store)
+        lenient = decode_page(encode_page(1, "青春", store, strict=False), store)
+        assert strict is not None and strict.strict is True
+        assert lenient is not None and lenient.strict is False
 
     def test_mode_bit_roundtrips_token(self) -> None:
         """长查询走 token 时模式位一样要活着。"""
         store = QueryStore()
-        ref = decode_page(encode_page(1, LONG_TITLE, store, title_only=True), store)
+        ref = decode_page(encode_page(1, LONG_TITLE, store, strict=True), store)
         assert ref is not None
-        assert ref.title_only is True
+        assert ref.strict is True
 
     @pytest.mark.parametrize("page", [0, 1, 9, 99, 999])
-    @pytest.mark.parametrize("title_only", [True, False])
-    def test_never_exceeds_limit(self, page: int, title_only: bool) -> None:
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_never_exceeds_limit(self, page: int, strict: bool) -> None:
         """任何页码 + 任何长度的查询词 + 任一模式，编出来都不能超 64 字节。
 
-        加模式位是 +2 字节（':t'/':f'），token 形态最坏也就 't:999:t:xxxxxxxx'
+        加模式位是 +2 字节（':s'/':l'），token 形态最坏也就 't:999:s:xxxxxxxx'
         = 15 字节，离 64 还远。这条把「加模式位后是否仍 ≤64」钉死。
         """
         store = QueryStore()
         for q in ("英雄", LONG_TITLE, "啊" * 200, "#奇幻 #异世界 #轻改 #龙傲天 #厕纸"):
-            data = encode_page(page, q, store, title_only=title_only)
+            data = encode_page(page, q, store, strict=strict)
             assert len(data.encode()) <= MAX_CALLBACK_BYTES, f"{q[:20]!r} 超限"
 
     def test_same_query_same_token(self) -> None:
         store = QueryStore()
-        a = encode_page(0, LONG_TITLE, store, title_only=False)
-        b = encode_page(1, LONG_TITLE, store, title_only=False)
+        a = encode_page(0, LONG_TITLE, store, strict=False)
+        b = encode_page(1, LONG_TITLE, store, strict=False)
         assert a.rsplit(":", 1)[1] == b.rsplit(":", 1)[1]
         assert len(store) == 1
 
     def test_expired_token_returns_none(self) -> None:
         """LRU 淘汰后必须返回 None，让 handler 给出"搜索已过期"而不是搜错东西。"""
         store = QueryStore(capacity=2)
-        data = encode_page(0, LONG_TITLE, store, title_only=False)
-        encode_page(0, LONG_TITLE + "A", store, title_only=False)
-        encode_page(0, LONG_TITLE + "B", store, title_only=False)
+        data = encode_page(0, LONG_TITLE, store, strict=False)
+        encode_page(0, LONG_TITLE + "A", store, strict=False)
+        encode_page(0, LONG_TITLE + "B", store, strict=False)
         assert decode_page(data, store) is None
 
     def test_lru_keeps_recently_used(self) -> None:
         store = QueryStore(capacity=2)
-        first = encode_page(0, LONG_TITLE, store, title_only=False)
-        encode_page(0, LONG_TITLE + "A", store, title_only=False)
+        first = encode_page(0, LONG_TITLE, store, strict=False)
+        encode_page(0, LONG_TITLE + "A", store, strict=False)
         decode_page(first, store)                     # 摸一下，变成最近使用
-        encode_page(0, LONG_TITLE + "B", store, title_only=False)  # 该淘汰 A 而非 first
+        encode_page(0, LONG_TITLE + "B", store, strict=False)  # 该淘汰 A 而非 first
         assert decode_page(first, store) is not None
 
     @pytest.mark.parametrize(
         "bad",
         # 少段、页码非数字、模式位非法、前缀未知 —— 都得挡住
-        ["", "s", "s:", "s:1", "s:1:f", "s:abc:f:x", "s:1:z:x", NOOP,
-         "zzz:1:f:x", "s:-1:f:x"],
+        ["", "s", "s:", "s:1", "s:1:l", "s:abc:l:x", "s:1:z:x", NOOP,
+         "zzz:1:l:x", "s:-1:l:x"],
     )
     def test_malformed_returns_none(self, bad: str) -> None:
         assert decode_page(bad, QueryStore()) is None
@@ -364,40 +364,6 @@ class TestRenderPage:
         text = render_page(page, settings)
         assert "<script>" not in text
         assert "&lt;script&gt;" in text
-
-    async def test_fallback_hint_shown(
-        self, repo: PostRepo, search: SearchService, settings: Settings
-    ) -> None:
-        """标题零命中回退全文时，顶部要有「没匹配到标题」提示，别让用户以为真有这番。"""
-        await repo.upsert_many([make_post(1, "某动画", raw_text="导演: 山田尚子")])
-        page = await search.search_page("山田尚子", title_only=False)
-        text = render_page(page, settings)
-        assert page.fallback is True
-        assert "没匹配到标题" in text
-        assert "相关内容" in text
-
-    async def test_no_fallback_hint_on_title_hit(
-        self, repo: PostRepo, search: SearchService, settings: Settings
-    ) -> None:
-        """标题有命中就绝不打提示行 —— 那行只属于回退场景。"""
-        await repo.upsert_many([make_post(1, "青春猪头少年")])
-        page = await search.search_page("青春", title_only=False)
-        text = render_page(page, settings)
-        assert "没匹配到标题" not in text
-
-    async def test_fallback_hint_query_escaped(
-        self, settings: Settings
-    ) -> None:
-        """回退提示里也带查询词，一样要转义，不能开 XSS 口子。"""
-        page = SearchPage(
-            query="<b>x</b>",
-            hits=[SearchHit(make_post(1, "某番", raw_text="x"), 500.0, 1, "body")],
-            total=1, page=0, page_size=8, title_only=False, fallback=True,
-        )
-        text = render_page(page, settings)
-        assert "没匹配到标题" in text
-        assert "<b>x</b>" not in text.replace("没匹配到标题", "")  # 查询词本身不该原样出现
-        assert "&lt;b&gt;x&lt;/b&gt;" in text
 
 
 class TestPageKeyboard:

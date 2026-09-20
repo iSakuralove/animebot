@@ -95,10 +95,6 @@ def render_page(page: SearchPage, settings: Settings) -> str:
         format_hit_line(page.first_index + i, h, settings, terms)
         for i, h in enumerate(page.hits)
     )
-    if page.fallback:
-        # 标题零命中、回退了全文。挑明这批是「相关内容」而非标题命中，
-        # 否则用户以为真有部叫「青春」的番。
-        head = f"没匹配到标题，以下是“{_esc(page.query)}”相关内容：\n\n{head}"
     return f"{head}\n\n{body}"
 
 
@@ -126,7 +122,7 @@ def _nav_row(page: SearchPage, store: QueryStore) -> list[InlineKeyboardButton]:
         return InlineKeyboardButton(
             text=label if enabled else "·",
             callback_data=(
-                encode_page(target, page.query, store, title_only=page.title_only)
+                encode_page(target, page.query, store, strict=page.strict)
                 if enabled else NOOP
             ),
         )

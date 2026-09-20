@@ -42,16 +42,15 @@ _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 @command(
     "s",
-    desc="搜索番剧",
+    desc="严谨搜索（精确匹配标题，不猜错字）",
     usage="/s 无职英雄",
     aliases=("search", "find"),
     rate=(6, 20),
     long_help=(
-        "支持多个关键词（空格分隔，命中越多排越前）、错别字容错、"
-        "标签筛选。结果多于一页时下面会出现翻页按钮。\n\n"
+        "严谨模式：标题精确子串匹配，打错字不会纠正、也不返回相关内容 —— "
+        "要么命中要么没有。想让打错字也能搜到，直接发文字（不加 /s）。\n\n"
         "例子:\n"
         "/s 无职英雄\n"
-        "/s 咒术回站      （打错字也能搜到）\n"
         "/s #奇幻 #异世界  （标签交集）\n"
         "/s #百合 学园     （标签 + 关键词）"
     ),
@@ -65,8 +64,8 @@ async def cmd_search(
     query = command_arg(message)
     if not query:
         raise UsageError("要搜什么？", "/s 无职英雄")
-    # /s 走全文模式：标题优先，标题零命中才回退全文（带提示）。
-    await _reply_search(message, query, search, settings, query_store, title_only=False)
+    # /s = 严谨：标题子串精确匹配，不 fuzzy、不回退全文。没有就是没有。
+    await _reply_search(message, query, search, settings, query_store, strict=True)
 
 
 async def on_plain_text(
@@ -75,15 +74,15 @@ async def on_plain_text(
     settings: Settings,
     query_store: QueryStore,
 ) -> None:
-    """私聊里的纯文本 = 标题搜索。只在私聊注册（见 register_plain_search）。
+    """私聊里的纯文本 = 宽松搜索。只在私聊注册（见 register_plain_search）。
 
-    标题命中天然少，一条消息装得下、不翻页、只一次 Telegram 往返 —— 这才是
-    用户要的「一点即达」手感。零命中走 fuzzy 纠错，仍在标题域，不回退全文。
+    标题命中优先；零命中走 fuzzy 纠错（「咒术回站」→「咒术回战」），仍在标题域。
+    这是默认、宽容的入口；要精确匹配就用 /s。
     """
     query = (message.text or "").strip()
     if not query:   # 过滤器已挡掉无文本消息，这里只是防御
         return
-    await _reply_search(message, query, search, settings, query_store, title_only=True)
+    await _reply_search(message, query, search, settings, query_store, strict=False)
 
 
 async def _reply_search(
@@ -93,11 +92,11 @@ async def _reply_search(
     settings: Settings,
     query_store: QueryStore,
     *,
-    title_only: bool,
+    strict: bool,
 ) -> None:
-    """两个入口的共同主体。差别只在查询词来源和 title_only，逻辑一份。"""
+    """两个入口的共同主体。差别只在查询词来源和 strict，逻辑一份。"""
     bind(query=query[:80])
-    page = await search.search_page(query, title_only=title_only)
+    page = await search.search_page(query, strict=strict)
     METRICS.incr("search.query", found=not page.is_empty)
     METRICS.observe("search.results", page.total)
     bind(
@@ -202,9 +201,9 @@ async def on_page(
         METRICS.incr("search.page_expired")
         return
 
-    # 按原模式重查：全文模式的翻页不能被当标题模式重搜，否则结果集变、翻页串。
+    # 按原模式重查：严谨/宽松结果集不同，翻页不能换模式，否则串位。
     page = await search.search_page(
-        ref.query, page=ref.page, title_only=ref.title_only
+        ref.query, page=ref.page, strict=ref.strict
     )
     METRICS.incr("search.page_turn")
     bind(query=ref.query[:80], page=ref.page)

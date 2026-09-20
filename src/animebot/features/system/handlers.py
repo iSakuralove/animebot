@@ -9,6 +9,7 @@ import html
 import platform
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from aiogram.types import Message
 
@@ -19,8 +20,14 @@ from ...core.errors import NotFound
 from ...core.registry import CommandRegistry, command
 from ...ingest.sync import ChannelSync
 from ...observability.context import RequestContext
+from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
 from ...storage.repo import PostRepo
+
+if TYPE_CHECKING:
+    from aiogram import Dispatcher
+
+log = get_logger("animebot.system")
 
 _BOOT = time.time()
 
@@ -151,6 +158,35 @@ async def cmd_syncstat(message: Message, sync: ChannelSync, settings: Settings) 
         f"频道: <code>{settings.channel_id}</code>",
     ]
     await message.reply("\n".join(lines))
+
+
+@command(
+    "stop",
+    desc="停止 bot 运行",
+    admin_only=True,
+    long_help=(
+        "让 bot 进程退出。生产环境（systemd）下不会被自动拉起，"
+        "重启用 `systemctl restart animebot`。主要用途：本地开发前先停掉线上实例，"
+        "避免同 token 两处轮询 409 互踢。"
+    ),
+)
+async def cmd_stop(
+    message: Message, trace: RequestContext, dispatcher: Dispatcher
+) -> None:
+    """优雅停止：标记 stop_requested + 请求 stop_polling，让 runner 干净收尾。
+
+    不用 os._exit 硬杀 —— 那样 `App.aclose()`（关 DB、关 HTTP 会话）跑不到。
+    这里只把停止意图交给 polling 循环：`stop_polling()` 让 `start_polling()`
+    返回，runner 看到 `stop_requested` 就退出码 42，systemd 认得这是主动停止
+    （RestartPreventExitStatus=42）不拉起。回复先发出去，polling 停在下一轮。
+    """
+    log.warning("bot.stop_requested", user_id=trace.user_id, username=trace.username)
+    dispatcher["stop_requested"] = True
+    await message.reply(
+        "🛑 正在停止…\n"
+        "生产环境不会自动重启，需要 <code>systemctl restart animebot</code>。"
+    )
+    await dispatcher.stop_polling()
 
 
 @command("metrics", desc="运行指标", admin_only=True)

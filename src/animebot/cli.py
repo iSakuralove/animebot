@@ -152,8 +152,7 @@ async def cmd_commands(_args: argparse.Namespace) -> int:
 async def cmd_run(_args: argparse.Namespace) -> int:
     from .bot.runner import run_polling
 
-    await run_polling()
-    return 0
+    return await run_polling()
 
 
 def build_parser() -> argparse.ArgumentParser:

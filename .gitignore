@@ -50,3 +50,6 @@ htmlcov/
 *~
 .DS_Store
 Thumbs.db
+
+# codegraph 本地索引，不进版本库
+.codegraph/

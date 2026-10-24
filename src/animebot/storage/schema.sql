@@ -4,6 +4,8 @@
 --   tags / index_tags 是查询维度 -> 独立关联表 + 索引，支持组合筛选和标签云。
 --   aliases / staff / links / passwords / extra 是载荷 -> JSON 列，不参与筛选。
 --   raw_text 永久保留，解析器改版后可以整库重跑而不必重新导出。
+--   多个频道（动漫 / 漫画）共用这些表，channel_id 是主键的一部分，也是每个检索
+--   查询的作用域 —— 不存在「不带频道的检索」。
 
 CREATE TABLE IF NOT EXISTS posts (
     channel_id       INTEGER NOT NULL,
@@ -52,6 +54,22 @@ CREATE TABLE IF NOT EXISTS post_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tags_lookup ON post_tags (kind, tag);
+
+-- 频道里直接发的文件（文档消息）。漫画频道早期把整卷压缩包紧跟在资料帖后面发。
+--
+-- 只记事实，不记归属：文件属于「message_id 不大于它的、最近的那个有效帖子」，
+-- 这条规则只在 PostRepo.file_stats 的 SQL 里，读的时候现算。两条写入路径
+-- （回填 / 增量）因此都只管记一行事实；帖子后来被编辑成公告、公告被编辑成帖子，
+-- 归属自动跟着变，不需要回头改任何一行。
+CREATE TABLE IF NOT EXISTS channel_files (
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    file_name   TEXT    NOT NULL DEFAULT '',
+    file_size   INTEGER NOT NULL DEFAULT 0,
+    mime_type   TEXT    NOT NULL DEFAULT '',
+    ingested_at TEXT    NOT NULL,
+    PRIMARY KEY (channel_id, message_id)
+);
 
 -- 每次回填/同步的审计记录，用来发现解析成功率的回退
 CREATE TABLE IF NOT EXISTS ingest_runs (

@@ -17,16 +17,61 @@ uv run python -m animebot run
 |---|---|
 | `feature.loaded` | 每个模块加载成功 |
 | `app.wired` | 模块和指令装配完成 |
-| `app.ready` | 数据库连上，报告帖子数 |
+| `manga.ready` | 漫画模块就绪，报告漫画频道的帖子 / 文件数 |
+| `manga.empty` | **漫画频道还没回填**，`/c` 什么都搜不到 |
+| `app.ready` | 数据库连上，按频道报告帖子数和文件数 `posts={anime:…, manga:…}` |
 | `bot.commands_synced` | 指令菜单已推给 Telegram |
 | `bot.start` | 拿到 `getMe`，token 有效 |
 | `bot.proxy` | 走了代理（`ANIMEBOT_PROXY` 非空时）|
-| `preflight.channel_ok` | bot 在频道里是管理员 |
-| `preflight.channel_unreachable` | **增量同步不会工作** |
+| `preflight.channel_ok` | bot 在该频道（`channel=anime/manga`）里是管理员；`username=` 是频道真实的 username |
+| `preflight.channel_unreachable` | **该频道的增量同步不会工作** |
 | `preflight.username_mismatch` | 深链会指向错误的频道 |
 
 启动阶段的 `getMe`/`setMyCommands`/`preflight` 三次 API 调用顺带把到 Telegram 的
 连接预热好了 —— 用户第一次翻页不用再吃一次冷启动建连（实测 ~2000ms）。
+
+## 漫画频道（`/c`）上线清单
+
+数据库文件不进仓库，VPS 上的库要在 VPS 上灌。回填幂等、按频道隔开，往已有的
+动漫库里灌漫画不会动动漫的数据 —— 但灌之前照样先备份。
+
+1. **拉代码、装依赖**：`git pull && uv sync`。启动时 `init_schema()` 会给老库自动
+   加上 `channel_files` 表（`CREATE TABLE IF NOT EXISTS`，不需要迁移）。
+2. **备份库**：用 SQLite 的在线备份，而不是 `cp`（bot 可能正开着 WAL）：
+   `uv run python -c "import sqlite3; s=sqlite3.connect('data/animebot.db'); d=sqlite3.connect('data/animebot.db.bak'); s.backup(d)"`
+3. **把漫画频道的导出传上去并回填**：导出文件放在 `data/` 下（gitignored），
+   `uv run animebot ingest data/manga_export/result.json`。输出应是
+   `漫画频道 1659887654 … failed 0 … 写库 938 文件 271`。
+4. **启用模块**：`.env` 里 `ANIMEBOT_FEATURES=system,search,manga`（显式写了这一行
+   的话默认值不生效），重启。
+5. **看启动日志**：`manga.ready posts=938 files=271`，`bot.commands_synced count=6`
+   （多了 `/c`）。
+6. **想要增量同步**：把 bot 加进漫画频道并设为管理员，否则启动日志里会有
+   `preflight.channel_unreachable channel=manga`。`preflight.channel_ok` 里的
+   `username=` 就是频道 username，`link_mode=public` 时抄进
+   `ANIMEBOT_MANGA_CHANNEL_USERNAME`。
+
+## 看日志
+
+线上验证只有 `journalctl` 一个窗口，所以日志按「一次交互一行」设计
+（[ADR-0014](ADR/0014-access-log-one-line-per-request.md)）：
+
+```bash
+journalctl -u animebot -f                                  # 实时
+journalctl -u animebot --since today | grep handler.done   # 今天每一次交互
+journalctl -u animebot --since today | grep scope=manga    # 只看漫画
+journalctl -u animebot --since "7 days ago" | grep handler.done | grep result_count=0
+                                                           # 搜了没搜到 = 该补的资源
+journalctl -u animebot -p warning --since today            # 只看 WARNING 以上
+```
+
+`handler.done` 一行里有：指令、模块、结果（ok / user_error / error）、耗时、用户、
+原始参数，以及搜索类指令 bind 的 `scope` / `query` / `mode` / `result_count` /
+`page` / `reason`。超过 `slow_command_ms` 的同一行变成 WARNING `handler.slow`。
+
+polling 的瞬时网络故障（`Failed to fetch updates - TelegramNetworkError …`、
+`Bad Gateway`）是 WARNING，紧跟着一条 `Connection established` 就是自己恢复了。
+**ERROR 级别现在只留给真问题**：`handler.crash`（带完整栈）、409 冲突、token 失效。
 
 ## 部署前必须做的两件事
 
@@ -213,9 +258,9 @@ uv run pytest tests/test_parser_golden.py
 
 ## 数据备份
 
-只有一个文件：`data/animebot.db`。
+只有一个文件：`data/animebot.db`（两个频道都在里面）。
 
-但它**不是唯一真相** —— 导出 JSON 才是。库丢了从导出重灌，upsert 幂等，
+但它**不是唯一真相** —— 导出 JSON 才是。库丢了从两份导出各重灌一次，upsert 幂等，
 灌 10 次结果一样。所以备份优先级：导出 JSON > 数据库。
 
 `.gitignore` 排除了 `data/`：几十 MB 的二进制进版本库，每次回填都产生一个

@@ -42,12 +42,14 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 | `/search` | 多词、错别字容错、`#标签` 筛选、**分页 + 关键词高亮** |
 | `/check` | 只回答发过 / 没发过 |
 | `/tags` | 标签列表 + 拼音首字母索引 |
+| `/c` | **漫画频道**（ACG Library，938 帖）检索：标题 / 别名、标签、错字纠错（标明「名字相近」）、分页；结果行带作者 · 卷数 · 连载年份 · 📦频道内整卷文件；不带词时给热门标签按钮。见 [design/manga-search.md](design/manga-search.md) |
 | `/help` | 从注册表自动生成，加指令不用手写帮助 |
 | `/ping` `/trace` | 测活、看本次请求的追踪信息 |
-| `/health` `/metrics` `/syncstat` | 管理员专用 |
-| CLI | `ingest` / `stats` / `syncstat` / `search` / `commands` / `run` |
+| `/health` `/metrics` `/syncstat` | 管理员专用，每个频道分开报 |
+| CLI | `ingest` / `stats` / `syncstat` / `search [--channel manga]` / `commands` / `run` |
 | 模块化框架 | 加模块 = 建一个包 + 加一个名字，不改已有文件 |
-| 可观测性 | trace_id 全链路、结构化日志、进程内埋点、同步双水位 |
+| 多频道 | 动漫 + 漫画同库、同解析器、同步共用，`channel_id` 隔开（[ADR-0013](ADR/0013-multi-channel-one-library.md)） |
+| 可观测性 | trace_id 全链路、**每次交互一条 INFO 访问日志**、结构化日志、进程内埋点、同步双水位 |
 
 ### 路线图
 
@@ -71,6 +73,8 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 | Web 管理后台 | `/health`、`/metrics`、CLI 已经覆盖调试需求。 |
 | Prometheus exporter | 埋点数据结构留了 `snapshot()`，真需要时导出即可。现在架一套基础设施不值得。 |
 | 端到端金丝雀探测 | 需要真人测试账号（bot 不能给 bot 发消息），风控风险 > 收益。 |
+| 把漫画文件转发给用户 | 资源是频道成员的福利；`copyMessage` 等于对非成员分发，还要求 bot 是频道管理员。结果里给跳到第一个文件的深链。 |
+| 动漫、漫画混在一起搜 | 两个频道的结果行元信息完全不同；私聊纯文本是动漫入口，要漫画就 `/c`。 |
 
 ## 验收标准
 
@@ -121,7 +125,7 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 
 ### 工程质量
 
-- `uv run pytest` 全绿（241 条）
+- `uv run pytest` 全绿（395 条）
 - `uv run ruff check src tests` 无告警
 - 加一个新指令模块不需要改 `app.py` / `cli.py` / 任何已有文件
 - 用户看到的错误：`UserError` 给原文，真 bug 给 8 位 trace_id，永不喷栈追踪
@@ -146,7 +150,7 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 
 只有两种角色，不做更细的：
 
-- **普通用户** —— `/search` `/check` `/tags` `/help` `/ping`
+- **普通用户** —— `/search` `/check` `/tags` `/c` `/help` `/ping`
 - **管理员**（`ANIMEBOT_ADMIN_IDS`）—— 额外有 `/health` `/metrics` `/syncstat`
 
 ## 非功能要求

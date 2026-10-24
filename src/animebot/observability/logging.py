@@ -22,6 +22,33 @@ _configured = False
 # 从 token 里泄出去就麻烦了，日志里一律打码
 _SECRET_KEYS = frozenset({"token", "bot_token", "api_key", "password", "authorization"})
 
+# aiogram 的 polling 循环遇到这几类故障会自己退避重连（Errno 104、Bad Gateway、
+# 超时）—— 线上每天好几次、几秒内自愈，它却打在 ERROR 上，把真正的错误
+# （handler.crash）淹没在 `grep error` 里。只降这几类；409 冲突、token 失效这种
+# 必须有人处理的照旧是 ERROR。
+_TRANSIENT_POLLING_ERRORS = frozenset({
+    "TelegramNetworkError", "TelegramServerError", "TelegramRetryAfter",
+})
+
+
+class _TransientPollingFilter(logging.Filter):
+    """把 aiogram「Failed to fetch updates - <异常类名>: ...」里的瞬时故障降成 WARNING。
+
+    按异常类名判（它是格式化参数，不是拼进消息的文字），不靠匹配报错原文。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.levelno == logging.ERROR
+            and record.msg == "Failed to fetch updates - %s: %s"
+            and isinstance(record.args, tuple)
+            and record.args
+            and record.args[0] in _TRANSIENT_POLLING_ERRORS
+        ):
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
 
 def _inject_trace(_logger: Any, _name: str, event: dict[str, Any]) -> dict[str, Any]:
     if ctx := current():
@@ -116,9 +143,11 @@ def setup_logging(
         )
         root.addHandler(fileh)
 
-    # aiogram 的 INFO 太吵，只要 warning
+    # aiogram 的 INFO 太吵，只要 warning。它自己那条「Update id=… is handled」被
+    # 我们的 handler.done 取代 —— 后者带 trace_id、指令和业务字段。
     for noisy in ("aiogram.event", "aiohttp.access", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger("aiogram.dispatcher").addFilter(_TransientPollingFilter())
 
     _configured = True
 

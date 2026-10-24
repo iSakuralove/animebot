@@ -9,7 +9,7 @@
 依赖只能向下。任何向上的箭头都是设计错误。
 
 ```
-        features/          业务模块（system, search, bgm, agent...）
+        features/          业务模块（system, search, manga, bgm, agent...）
             │              指令用 @command 声明，只写业务逻辑
             ▼
     ┌───────┴────────┬──────────────┐
@@ -72,9 +72,11 @@ Dispatcher
   │     参数来自 @command(rate=(6, 20))
   │     超了抛 RateLimited（也是 UserError）
   │
-  ├─ ObservabilityMiddleware ──── 计时 + 埋点
+  ├─ ObservabilityMiddleware ──── 计时 + 埋点 + 访问日志
   │     handler.calls{command=search,feature=search,outcome=ok}
-  │     handler.latency{...}；超过 slow_command_ms 打 warning
+  │     handler.latency{...}；每个被处理的 update 一条 INFO handler.done
+  │     （带 handler bind 的 query / result_count），超过 slow_command_ms 换成
+  │     WARNING handler.slow —— 见 ADR-0014
   │
   ▼
 Router (feature.search)
@@ -104,6 +106,28 @@ message.reply()
 分页状态全在 `callback_data` 里，服务端不存结果集
 （[ADR-0010](ADR/0010-pagination-state-in-callback-data.md)）。
 
+`/c 进击` 走的是同一条链，区别只有两处：handler 拿到的是绑在漫画频道上的
+`manga_search`（同一个 `SearchService` 类，构造时 `channel=settings.manga`），
+翻页按钮用漫画自己的前缀 `c:`/`ct:`/`cx`。
+
+## 多频道：频道是数据
+
+动漫和漫画两个频道共用**一个库、一个解析器、一个同步实例**
+（[ADR-0013](ADR/0013-multi-channel-one-library.md)）：
+
+```
+config.Channel(key, title, channel_id, username)
+Settings.channels = (anime, manga)
+        │
+        ├─ 回填：导出文件里的 id 必须是其中之一（resolve_channel）
+        ├─ 同步：ChannelSync 按 chat.id 查表，帖子 / 文件记到对应频道名下
+        ├─ 自检：每个频道查一遍 bot 的身份
+        └─ 检索：SearchService 构造时绑定一个频道，之后每次查库都带 channel_id
+```
+
+仓储的检索方法 `channel_id` 是**必填**关键字参数 —— 漏传作用域不会报错，只会
+让动漫结果里悄悄混进漫画帖，所以让它写不出来。
+
 ### 中间件顺序为什么是这个
 
 顺序不是随便排的，代码里也注释了（[app.py](../src/animebot/bot/app.py)）：
@@ -118,19 +142,20 @@ message.reply()
 
 ## 增量同步：第二条数据入口
 
-频道发新帖 / 编辑旧帖时，`ChannelSyncMiddleware` 把它写进索引：
+频道发新帖 / 编辑旧帖时，`ChannelSyncMiddleware` 把它写进索引（动漫、漫画两个频道
+都走这一个实例）：
 
 ```
 channel_post / edited_channel_post
   │
   ▼ ChannelSyncMiddleware（不是 handler —— 频道帖没有 @command 元数据）
-ChannelSync.accepts()  ── chat.id 不对 ──→ 丢弃（讨论群的转发副本，链接已失效）
+ChannelSync.channel_of()  ── chat.id 不是任何已配置的频道 ──→ 丢弃（讨论群的转发副本，链接已失效）
   │
   ▼ message_to_export_shape()   把 aiogram Message 转成导出 JSON 的形状
-  │                             UTF-16 偏移用 entity.extract_from() 换算
-  ▼ parse_message()             ← 与回填**完全相同**的解析器
-  ▼ upsert_many()               ← 与回填**完全相同**的写入
-  ▼ mark_seen()                 双水位：看到了什么 / 存了什么
+  │                             UTF-16 偏移用 entity.extract_from() 换算；文档消息带上文件名/大小
+  ▼ parse_message() / parse_file()   ← 与回填**完全相同**的解析器
+  ▼ upsert_many() / upsert_files()   ← 与回填**完全相同**的写入
+  ▼ mark_seen()                 双水位（按频道）：看到了什么 / 存了什么
 ```
 
 **两条入口共用解析器是这个设计的核心。** 两份解析代码必然漂移 —— 回填修的
@@ -176,14 +201,18 @@ importlib.import_module(f"animebot.features.{name}")  →  取模块的 FEATURE 
 
 ```
 build_container()  →  put("repo", ...)  put("search", ...)  put("registry", ...)
+feature.setup()    →  put("manga_search", ...)          ← 模块自己放的也算
                           │
-                          ▼
-              dp["repo"] = container.get("repo")
+                          ▼  _build_dispatcher：容器里的每一项原样交给 Dispatcher
+              dp["repo"], dp["search"], dp["manga_search"], ...
                           │
                           ▼ aiogram 把 workflow_data 当 kwargs 传给 handler
-              async def cmd_search(message, search, settings, trace)
+              async def cmd_manga(message, manga_search, repo, settings, query_store)
                                             └─ 参数名匹配容器键，自动拿到
 ```
+
+以前 `_build_dispatcher` 只抄了几个写死的键，模块 `setup()` 时放进容器的东西
+handler 拿不到 —— 加 manga 时才发现。现在是整个容器遍历过去，加模块不用改它。
 
 为什么不用全局变量：测试里要换成假的。为什么不用 DI 框架：这个规模下框架的
 启动顺序魔法比手写 20 行更难调试。
@@ -195,10 +224,11 @@ build_container()  →  put("repo", ...)  put("search", ...)  put("registry", ..
 | 组件 | 干什么 | 关键设计 |
 |---|---|---|
 | [context.py](../src/animebot/observability/context.py) | `RequestContext` 存 trace_id / user_id / command | 用 `contextvars` 而不是层层传参。asyncio 里天然按 Task 隔离，并发的两个 update 不串味（有测试验证） |
-| [logging.py](../src/animebot/observability/logging.py) | structlog，控制台给人看 / 文件 JSON 给机器看 | trace_id 由 processor 自动注入，业务代码写 `log.info("bgm.hit", subject_id=123)` 就够了，不会有人忘记传 |
+| [logging.py](../src/animebot/observability/logging.py) | structlog，控制台给人看 / 文件 JSON 给机器看 | trace_id 由 processor 自动注入，业务代码写 `log.info("bgm.hit", subject_id=123)` 就够了，不会有人忘记传。aiogram polling 的瞬时网络错误由 filter 降为 WARNING |
 | [metrics.py](../src/animebot/observability/metrics.py) | 进程内计数器 + 直方图 | 刻意做得很小，够回答「哪个指令在被用、哪个报错、哪个慢」。`snapshot()` 留了导出口 |
 
-日志里 `token` / `api_key` / `password` 这类键自动打码成 `***`。
+日志里 `token` / `api_key` / `password` 这类键自动打码成 `***`。每次交互一条 INFO
+`handler.done`（[ADR-0014](ADR/0014-access-log-one-line-per-request.md)）。
 
 ## 错误分类
 
@@ -231,29 +261,30 @@ Telegram Desktop 导出 result.json          频道发新帖 / 编辑
         │                                     Message → 导出 JSON 形状
         │                                     （UTF-16 偏移换算）
         └──────────────┬───────────────────────────┘
-                       ▼ parsing/post_parser.py
-              按行切 key → 查别名表 → Post
+                       ▼ parsing/post_parser.py + parsing/files.py
+              按行切 key → 查别名表 → Post；文档消息 → ChannelFile
                        │      时间统一 aware UTC；未知字段进 extra 永不丢
                        ▼ storage/repo.py
-              upsert posts + 重建 post_tags（+ 同步侧记水位）
+              upsert posts + 重建 post_tags + upsert channel_files（+ 同步侧记水位）
                        │      主键 (channel_id, message_id)，天然幂等
                        ▼
                  SQLite (WAL)
                        │
-                       ▼ search/service.py
+                       ▼ search/service.py（每个实例绑一个频道）
               LIKE 预筛 → rank 打分 → rapidfuzz 兜底 → 切页
                        │
-                       ▼ search/presenter.py
-              渲染 + 高亮 + 键盘（callback_data 只放 id 和页码）
+                       ▼ search/presenter.py · features/manga/presenter.py
+              渲染 + 高亮 + 键盘（callback_data 只放页码和查询词）
 ```
 
-两条入口在 `parse_message` 处汇合，之后完全共用。
+两条入口在 `parse_message` / `parse_file` 处汇合，之后完全共用。文件属于哪个帖子
+不入库，读的时候按「message_id 不大于它的最近一个帖子」现算（`repo.file_stats`）。
 
 ## 目录到职责
 
 ```
 src/animebot/
-├── config.py            集中配置。所有环境相关的东西只出现一次
+├── config.py            集中配置。所有环境相关的东西只出现一次；Channel 在这里
 ├── cli.py               ingest / stats / syncstat / search / commands / run
 ├── _util.py             没有归属的小工具（指令参数提取、时长格式化）
 ├── core/                内核，不依赖 aiogram
@@ -263,13 +294,13 @@ src/animebot/
 │   ├── errors.py        错误分类
 │   └── http.py          外部 API 基类（超时/重试/缓存/埋点）
 ├── observability/       trace、日志、埋点
-├── domain/              Post 模型 + 字段别名表
-├── parsing/             entity 拍平、按行切 key、解析成 Post（不依赖 aiogram）
+├── domain/              Post / ChannelFile 模型 + 字段别名表 + 链接分类
+├── parsing/             entity 拍平、按行切 key、解析成 Post / ChannelFile（不依赖 aiogram）
 ├── storage/             schema.sql + 异步仓储
-├── search/              检索服务 + 展示层 + 分页编解码 + 高亮
+├── search/              检索服务 + 展示层 + 分页编解码（PageCodec）+ 高亮
 ├── ingest/              回填、增量同步、Message→导出形状的转换
-├── bot/                 aiogram 装配：app / middlewares / wiring / loader / runner / preflight
-└── features/            业务模块，每个一个包
+├── bot/                 aiogram 装配：app / middlewares / wiring / loader / runner / preflight / ui
+└── features/            业务模块，每个一个包：system / search / manga
 ```
 
 ## 静默失败的防线

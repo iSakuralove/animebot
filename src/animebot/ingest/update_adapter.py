@@ -132,6 +132,16 @@ def message_to_export_shape(msg: Message) -> dict[str, Any]:
         # 解析器只看这个键存在与否（has_photo），不看值。
         # 不存 file_id：它是 per-bot 凭证，换 bot 就失效，存了也没用。
         shape["photo"] = "(live update)"
+    if msg.document:
+        # parse_file 读这四个键，和导出 JSON 里文档消息的形状一致。file_id 同上，不存。
+        shape["file"] = "(live update)"
+        shape["file_name"] = msg.document.file_name or ""
+        shape["file_size"] = msg.document.file_size or 0
+        shape["mime_type"] = msg.document.mime_type or ""
+        if msg.animation:
+            # Bot API 为了向后兼容给 GIF 同时填 document；导出把它标成 animation，
+            # parse_file 靠 media_type 把它排除在文件之外。
+            shape["media_type"] = "animation"
     if buttons := _buttons_to_export(msg):
         shape["inline_bot_buttons"] = buttons
     return shape

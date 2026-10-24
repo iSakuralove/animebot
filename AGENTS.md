@@ -5,9 +5,10 @@
 
 ## 这是什么项目
 
-Telegram 动漫频道帖子检索 bot。数据来自频道导出的 JSON（1600+ 帖），回填进
-SQLite，用户在私聊里搜番、拿网盘链接。Bot API 读不到频道历史，所以是「导出
-回填 + channel_post 增量同步」两条数据入口。
+Telegram 频道帖子检索 bot。两个频道：动漫频道（1600+ 帖，私聊直接发字 / `/s`）
+和漫画频道 ACG Library（938 帖，`/c`）。数据来自频道导出的 JSON，回填进同一个
+SQLite（`channel_id` 隔开），用户在私聊里搜、拿原帖链接。Bot API 读不到频道历史，
+所以是「导出回填 + channel_post 增量同步」两条数据入口，两个频道共用。
 
 ## 先读文档，别猜
 
@@ -23,7 +24,9 @@ SQLite，用户在私聊里搜番、拿网盘链接。Bot API 读不到频道历
 bot 跑在 VPS 上（直连 Telegram，比本地走代理快一倍）。**不要在本地起 bot** ——
 本地和线上用同一个 token，两处 `getUpdates` 会 409 互踢，各拿一半消息，两边都坏。
 
-- 要真机验证：改完 push，在 VPS 上 `git pull` + 重启，看 `journalctl`。
+- 要真机验证：改完 push，在 VPS 上 `git pull` + 重启，看 `journalctl`。每次用户
+  交互是一行 INFO `handler.done`（带 query / result_count），`grep handler.done`
+  就能确认指令真的被处理了 —— 见 [docs/operations.md](docs/operations.md)「看日志」。
 - 停 / 重启 / 看日志：从自己电脑一条 `ssh <vps> 'systemctl stop|restart|status animebot'`
   即可。**停 bot 是运维动作，不做成 Telegram 指令** —— 那等于给聊天窗口一个单点
   关停开关，一个人停掉全频道就用不了了。
@@ -40,6 +43,7 @@ uv run pytest -q                     # 全套测试
 uv run ruff check src tests          # lint（提交前必过）
 uv run animebot commands             # 看指令装配（不连网）
 uv run animebot search "无职英雄"     # CLI 搜索（不连网，验检索逻辑）
+uv run animebot search 进击的巨人 --channel manga   # 搜漫画频道（/c 的数据）
 uv run animebot run                  # 起 bot —— 只在确认线上已停时才在本地跑
 ```
 
@@ -52,10 +56,13 @@ uv run animebot run                  # 起 bot —— 只在确认线上已停�
   [docs/adding_a_feature.md](docs/adding_a_feature.md)。
 - 遵循 Linus 式取舍：消除特殊情况优于加分支，实测数据优于臆想，向后兼容是底线。
 
-## 两个反复踩过的坑
+## 反复踩过的坑
 
 1. **假夹具掩盖真 bug**：测试里把 aiogram 的方法换成 `async def` 假货，会让
    「gather 塞了非 coroutine」这类 bug 永远测不出来。测真实调用路径，别只测桩。
 2. **本地默认值掩盖 env 解析**：pydantic-settings 对 tuple 字段会先 `json.loads`，
    本地没配 env 走默认值就发现不了，部署到真配 env 的机器才炸。配置改动要在
    「真的设了这个 env」的前提下验证。
+3. **两个频道同一张表**：仓储的检索方法 `channel_id` 是必填的，别为了省事给它加
+   默认值 —— 漏传作用域不报错，只会让动漫结果里混进漫画帖。改别名表要两份黄金
+   数据集（`test_parser_golden.py` / `test_manga_parse.py`）都绿。

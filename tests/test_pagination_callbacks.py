@@ -294,7 +294,7 @@ async def test_page_button_edits_in_place(
 async def test_safe_edit_uses_real_shortcut_methods(
     fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """回归：_safe_edit 必须能吃 aiogram 的真 shortcut 方法。
+    """回归：safe_edit 必须能吃 aiogram 的真 shortcut 方法。
 
     上面那些测试把 CallbackQuery.answer / Message.edit_text 换成了 async def 假货，
     于是 asyncio.gather 拿到的是普通 coroutine，永远不会触发真 bug。
@@ -304,8 +304,9 @@ async def test_safe_edit_uses_real_shortcut_methods(
     "unhashable type: 'AnswerCallbackQuery'"，线上每次翻页都崩。
 
     这里只 fake 会话层的网络调用（bot(...)），保留真 shortcut，复现那条路径。
+    动漫和漫画的翻页都走 bot.ui.safe_edit 这一个实现。
     """
-    from animebot.features.search.handlers import _safe_edit
+    from animebot.bot.ui import safe_edit
 
     calls: list[str] = []
 
@@ -329,6 +330,6 @@ async def test_safe_edit_uses_real_shortcut_methods(
     ).as_(fake_bot)
 
     # 不该抛 unhashable，且两个 API 都真的发了
-    await _safe_edit(cb, "新内容")
+    await safe_edit(cb, "新内容")
     assert "AnswerCallbackQuery" in calls
     assert "EditMessageText" in calls

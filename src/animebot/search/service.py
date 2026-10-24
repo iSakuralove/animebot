@@ -8,19 +8,20 @@ rapidfuzz 对 1447 个标题模糊排序 10ms。所以这里就是 LIKE 预筛 +
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz, process
 
-from ..config import Settings
+from ..config import Channel, Settings
 from ..domain.post import Post
 from ..storage.repo import PostRepo
 
 # 取候选的签名。目前只有 repo.like_titles 走这条 —— 全文入口已移除
 # （ADR-0012：/s 严谨、纯文本宽松，都只搜标题）。留成参数是因为 _ranked_over
-# 本身与候选来源无关，将来若加「全文」命令可直接复用。
+# 本身与候选来源无关，将来若加「全文」命令可直接复用。频道作用域在构造时绑死。
 _Lookup = Callable[[str, int], Awaitable[list[Post]]]
 
 _HASHTAG = re.compile(r"#([0-9A-Za-z_一-鿿぀-ヿー]+)")
@@ -137,9 +138,20 @@ def rank_terms(post: Post, terms: list[str]) -> tuple[float, int, str]:
 
 
 class SearchService:
-    def __init__(self, repo: PostRepo, settings: Settings) -> None:
+    """一个频道的检索。动漫和漫画各一个实例，共用同一个库。
+
+    频道在构造时绑死，之后每一次查库都带着它 —— 两个频道在同一张表里，
+    作用域漏一次，动漫结果里就会混进漫画帖。
+    """
+
+    def __init__(
+        self, repo: PostRepo, settings: Settings, *, channel: Channel | None = None
+    ) -> None:
         self._repo = repo
         self._cfg = settings
+        self.channel = channel or settings.anime
+        cid = self.channel.channel_id
+        self._like_titles: _Lookup = functools.partial(repo.like_titles, channel_id=cid)
 
     async def search(
         self, raw: str, limit: int | None = None, *, strict: bool = False
@@ -202,14 +214,16 @@ class SearchService:
         # 纯标签查询：候选就是结果，保持 posted_at DESC 顺序，不打分不排序。
         if q.tags and not q.terms:
             cap = self._cfg.search_max_candidates
-            posts = await self._repo.by_tags(q.tags, limit=cap)
+            posts = await self._repo.by_tags(
+                q.tags, channel_id=self.channel.channel_id, limit=cap
+            )
             return [SearchHit(p, 0.0, 0, "tag") for p in posts]
 
         if not q.terms:
             return []
 
         # 只搜标题。标签过滤在判空之前 —— 标题命中被标签滤光时，才等价于「零命中」。
-        title_hits = await self._ranked_over(q, self._repo.like_titles)
+        title_hits = await self._ranked_over(q, self._like_titles)
         if title_hits or strict:
             # strict：有就返回，没有就返回空（不 fuzzy 兜底）。
             return title_hits
@@ -254,7 +268,7 @@ class SearchService:
     async def _fuzzy(self, kw: str, limit: int) -> list[SearchHit]:
         """错别字容错。WRatio 实测最稳：无值英雄→无职英雄、咒术回站→咒术回战、
         白色相薄2→白色相簿2 都排第一，而 ratio/QRatio 在第一个例子上直接跑偏。"""
-        rows = await self._repo.all_titles()
+        rows = await self._repo.all_titles(channel_id=self.channel.channel_id)
         if not rows:
             return []
         choices = {i: title.lower() for i, (_, _, title) in enumerate(rows)}

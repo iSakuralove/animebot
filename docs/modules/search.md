@@ -12,6 +12,22 @@
 `service` / `presenter` 分开是因为「怎么算相关性」和「怎么显示」变化频率完全
 不同 —— 前者半年不动，后者随时在调。
 
+## 一个实例绑一个频道
+
+`SearchService(repo, settings, channel=...)` 构造时绑定频道，默认动漫
+（`settings.anime`）；漫画模块用 `channel=settings.manga` 另建一个实例放进容器
+（`manga_search`）。之后每一次查库 —— LIKE 预筛、标签筛选、fuzzy 的全量标题 ——
+都带着这个 `channel_id`。
+
+两个频道在同一张表里（[ADR-0013](../ADR/0013-multi-channel-one-library.md)），
+作用域漏一次就是串台，所以仓储的检索方法把 `channel_id` 设成必填关键字参数。
+`test_channels.py` 让两个频道各有一部「进击的巨人」和同名标签，任何一路漏了都会红。
+
+漫画的结果行在 [features/manga/presenter.py](../../src/animebot/features/manga/presenter.py)，
+不在这里：元信息（作者、卷数、连载年份、📦文件）和动漫完全不同，硬塞进一个
+presenter 只会多出一堆 `if channel == ...`。共用的只有骨架 —— `page_keyboard`、
+`highlight`、`query_terms`。
+
 ## 三层管线
 
 ```
@@ -133,6 +149,20 @@
 多这 2 字节（`:t` / `:f`），token 形态最坏 `t:999:t:xxxxxxxx` = 15 字节，离 64
 还远（`test_never_exceeds_limit` 对两种模式都参数化盯着）。query 仍是
 `split(":", 3)` 的最后一段，内部冒号（`Re:从零开始`）照样活着。
+
+### 每个频道一套前缀（PageCodec）
+
+| 频道 | 内联 | token | 占位 |
+|---|---|---|---|
+| 动漫 | `s:` | `t:` | `x` |
+| 漫画 | `c:` | `ct:` | `cx` |
+
+`PageCodec(inline, token, noop)` 是同一套编解码，参数化了前缀；`encode_page` /
+`decode_page` 是动漫那套的薄包装，老代码和老测试不用改。路由用
+`F.data.func(codec.owns)`，每个模块只接自己的前缀，谁也不依赖对方被加载。
+
+**动漫那套前缀不能动。** 已经发出去的翻页按钮还躺在用户的聊天记录里；改格式
+会让它们全部失效，加前缀是纯增量（`test_legacy_anime_format_unchanged`）。
 
 ## 高亮：先定位，再逐段转义
 

@@ -30,7 +30,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ..config import Settings
 from ..domain.post import Post
-from .callbacks import NOOP, QueryStore, encode_page
+from .callbacks import ANIME_PAGES, PageCodec, QueryStore
 from .highlight import highlight, query_terms
 from .service import SearchHit, SearchPage
 
@@ -98,21 +98,26 @@ def render_page(page: SearchPage, settings: Settings) -> str:
     return f"{head}\n\n{body}"
 
 
-def page_keyboard(page: SearchPage, store: QueryStore) -> InlineKeyboardMarkup | None:
+def page_keyboard(
+    page: SearchPage, store: QueryStore, codec: PageCodec = ANIME_PAGES
+) -> InlineKeyboardMarkup | None:
     """只有翻页行。
 
     不再有序号按钮 —— 每条结果的标题本身就是跳原帖的超链接，序号按钮再开一个
     "无图详情" 是同一件事的第二条路，纯属重复。单页结果没有翻页行，返回 None。
+    `codec` 决定按钮回到哪个模块（动漫 s:/t:，漫画 c:/ct:）。
     """
     if page.is_empty or page.pages <= 1:
         return None
 
     kb = InlineKeyboardBuilder()
-    kb.row(*_nav_row(page, store))
+    kb.row(*_nav_row(page, store, codec))
     return kb.as_markup()
 
 
-def _nav_row(page: SearchPage, store: QueryStore) -> list[InlineKeyboardButton]:
+def _nav_row(
+    page: SearchPage, store: QueryStore, codec: PageCodec
+) -> list[InlineKeyboardButton]:
     """⏮ ◀ 3/72 ▶ ⏭
 
     到边界的按钮**保留但变成占位**，不移除。移除会让按钮位置在翻页时左右跳动，
@@ -122,15 +127,15 @@ def _nav_row(page: SearchPage, store: QueryStore) -> list[InlineKeyboardButton]:
         return InlineKeyboardButton(
             text=label if enabled else "·",
             callback_data=(
-                encode_page(target, page.query, store, strict=page.strict)
-                if enabled else NOOP
+                codec.encode(target, page.query, store, strict=page.strict)
+                if enabled else codec.noop
             ),
         )
 
     return [
         nav("⏮", 0, page.has_prev),
         nav("◀", page.page - 1, page.has_prev),
-        InlineKeyboardButton(text=f"{page.page + 1}/{page.pages}", callback_data=NOOP),
+        InlineKeyboardButton(text=f"{page.page + 1}/{page.pages}", callback_data=codec.noop),
         nav("▶", page.page + 1, page.has_next),
         nav("⏭", page.pages - 1, page.has_next),
     ]

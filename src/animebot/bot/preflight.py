@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramAPIError
 
-from ..config import Settings
+from ..config import Channel, LinkMode, Settings
 from ..observability.logging import get_logger
 
 log = get_logger("animebot.preflight")
@@ -46,12 +46,12 @@ class ChannelAccess:
         )
 
 
-async def check_channel_access(bot: Bot, settings: Settings) -> ChannelAccess:
+async def check_channel_access(bot: Bot, channel: Channel) -> ChannelAccess:
     """查 bot 在目标频道的身份。任何异常都转成结果对象，不抛。
 
     启动自检不该能让 bot 起不来 —— 网络抖一下就拒绝启动是把可用性换成了洁癖。
     """
-    chat_id = settings.bot_api_chat_id
+    chat_id = channel.bot_api_chat_id
     try:
         chat = await bot.get_chat(chat_id)
         member = await bot.get_chat_member(chat_id, bot.id)
@@ -67,27 +67,35 @@ async def check_channel_access(bot: Bot, settings: Settings) -> ChannelAccess:
     )
 
 
-async def preflight(bot: Bot, settings: Settings) -> ChannelAccess:
-    """跑一遍自检并把结论写进日志。返回结果供 /health 复用。"""
-    access = await check_channel_access(bot, settings)
-    if access.ok:
-        log.info(
-            "preflight.channel_ok",
-            channel=access.chat_title,
-            username=access.username,
-            status=access.status,
+async def preflight(bot: Bot, settings: Settings) -> dict[str, ChannelAccess]:
+    """每个被索引的频道跑一遍自检，结论写进日志。返回值（频道 key -> 结论）供 /health 复用。"""
+    out: dict[str, ChannelAccess] = {}
+    for channel in settings.channels:
+        out[channel.key] = access = await check_channel_access(bot, channel)
+        _log_access(channel, access, settings.link_mode)
+    return out
+
+
+def _log_access(channel: Channel, access: ChannelAccess, link_mode: LinkMode) -> None:
+    if not access.ok:
+        log.warning("preflight.channel_unreachable", channel=channel.key,
+                    channel_id=channel.channel_id, status=access.status, hint=access.hint)
+        return
+    log.info(
+        "preflight.channel_ok",
+        channel=channel.key,
+        title=access.chat_title,
+        username=access.username,
+        status=access.status,
+    )
+    # 配的 username 和频道实际的不一致 -> 公开深链会指向错误的地方或 404
+    configured = channel.username.lstrip("@").lower()
+    actual = access.username.lower()
+    if link_mode == "public" and actual and configured != actual:
+        log.warning(
+            "preflight.username_mismatch",
+            channel=channel.key,
+            configured=channel.username,
+            actual=access.username,
+            hint="公开深链会指向错误的频道或退回 /c/ 链接，改对应频道的 *CHANNEL_USERNAME",
         )
-        # 配的 username 和频道实际的不一致 -> 深链会指向错误的地方或 404
-        configured = settings.channel_username.lstrip("@").lower()
-        actual = access.username.lower()
-        if settings.link_mode == "public" and actual and configured != actual:
-            log.warning(
-                "preflight.username_mismatch",
-                configured=settings.channel_username,
-                actual=access.username,
-                hint="公开深链会指向错误的频道，改 ANIMEBOT_CHANNEL_USERNAME",
-            )
-    else:
-        log.warning("preflight.channel_unreachable", status=access.status,
-                    hint=access.hint)
-    return access

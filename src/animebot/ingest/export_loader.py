@@ -5,16 +5,21 @@ Bot API 读不到频道历史消息（没有 getChatHistory / searchMessages，�
 
 内置一道 channel_id 校验：讨论群导出里的帖子全是频道帖的转发副本，链接是失效的，
 误灌进来会污染整个索引 —— 这个错真实发生过，所以默认拒绝而不是警告。
+导出属于哪个频道由文件自己的 id 决定，必须是配置里的某一个（动漫 / 漫画）。
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ..config import Channel
+from ..domain.files import ChannelFile
 from ..domain.post import ParseStatus, Post
+from ..parsing.files import parse_file
 from ..parsing.post_parser import parse_message
 from ..storage.repo import PostRepo
 
@@ -31,6 +36,7 @@ class IngestStats:
     failed: int = 0
     skipped: int = 0      # 公告、闲聊、service，不是帖子
     upserted: int = 0     # 实际写库的行数
+    files: int = 0        # 频道里直接发的文件（文档消息）
 
     def bump(self, status: ParseStatus) -> None:
         match status:
@@ -55,6 +61,21 @@ def load_export(path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"导出文件不存在: {path}")
     with path.open(encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_channel(doc: dict[str, Any], channels: Iterable[Channel]) -> Channel:
+    """导出文件属于哪个已配置的频道。都不是就拒绝 —— 理由同讨论群：灌错了是整库污染。"""
+    channel_id = int(doc["id"])
+    known = list(channels)
+    for c in known:
+        if c.channel_id == channel_id:
+            return c
+    listed = "、".join(f"{c.key}={c.channel_id}" for c in known)
+    raise ExportMismatch(
+        f"导出文件是 {doc.get('name')!r} (type={doc.get('type', '')}, id={channel_id})，"
+        f"不是已配置的频道（{listed}）。"
+        "如果这是讨论群的导出，里面的帖子都是频道帖的转发副本、链接已失效，不要灌进来。"
+    )
 
 
 def parse_export(
@@ -93,6 +114,36 @@ def parse_export(
     return posts, stats
 
 
+def parse_export_files(doc: dict[str, Any]) -> list[ChannelFile]:
+    """导出里的文件消息。频道校验由 parse_export 负责，回填总是两个一起调。"""
+    channel_id = int(doc["id"])
+    return [f for msg in doc.get("messages", []) if (f := parse_file(msg, channel_id))]
+
+
+async def ingest_doc(
+    doc: dict[str, Any],
+    repo: PostRepo,
+    *,
+    source: str,
+    expected_channel_id: int | None = None,
+    batch_size: int = 500,
+    trace_id: str = "",
+) -> IngestStats:
+    posts, stats = parse_export(doc, expected_channel_id=expected_channel_id)
+    files = parse_export_files(doc)
+
+    run_id = await repo.start_run(source=source, trace_id=trace_id)
+    try:
+        for i in range(0, len(posts), batch_size):
+            stats.upserted += await repo.upsert_many(posts[i : i + batch_size])
+        stats.files = await repo.upsert_files(files)
+    finally:
+        await repo.finish_run(
+            run_id, stats.as_dict(), note=f"{doc.get('name', '')} · 文件 {stats.files}"
+        )
+    return stats
+
+
 async def ingest_export(
     path: str | Path,
     repo: PostRepo,
@@ -101,13 +152,11 @@ async def ingest_export(
     batch_size: int = 500,
     trace_id: str = "",
 ) -> IngestStats:
-    doc = load_export(path)
-    posts, stats = parse_export(doc, expected_channel_id=expected_channel_id)
-
-    run_id = await repo.start_run(source=str(path), trace_id=trace_id)
-    try:
-        for i in range(0, len(posts), batch_size):
-            stats.upserted += await repo.upsert_many(posts[i : i + batch_size])
-    finally:
-        await repo.finish_run(run_id, stats.as_dict(), note=doc.get("name", ""))
-    return stats
+    return await ingest_doc(
+        load_export(path),
+        repo,
+        source=str(path),
+        expected_channel_id=expected_channel_id,
+        batch_size=batch_size,
+        trace_id=trace_id,
+    )

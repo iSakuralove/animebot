@@ -8,7 +8,8 @@
 | [loader.py](../../src/animebot/bot/loader.py) | 按名字动态 import 功能模块 |
 | [wiring.py](../../src/animebot/bot/wiring.py) | `@command` → aiogram Router |
 | [middlewares.py](../../src/animebot/bot/middlewares.py) | trace / 埋点 / 错误边界 / 限流 / 权限 / 频道同步 |
-| [preflight.py](../../src/animebot/bot/preflight.py) | 启动自检：bot 在频道里是管理员吗 |
+| [preflight.py](../../src/animebot/bot/preflight.py) | 启动自检：bot 在每个被索引的频道里是管理员吗 |
+| [ui.py](../../src/animebot/bot/ui.py) | `safe_edit`：翻页就地编辑。动漫、漫画两个模块共用，所以不放在任何一个 feature 里 |
 
 ## 中间件顺序是设计，不是偏好
 
@@ -28,7 +29,8 @@ Trace          ← 最外。之后所有日志自动带 trace_id
 2. **Access 和 RateLimit 必须在 ErrorBoundary 内侧** —— 它们抛的是 `UserError`，
    要被 ErrorBoundary 转成用户看得懂的回复。放外侧就变成未捕获异常。
 3. **Observability 在它们内侧** —— 计时不该包含中间件自己的开销，否则 p95 里
-   混着限流查表的时间。
+   混着限流查表的时间。它同时打访问日志：每个被处理的 update 一条 INFO
+   `handler.done`（[ADR-0014](../ADR/0014-access-log-one-line-per-request.md)）。
 4. **ChannelSync 最内** —— 频道帖没有"用户"也没有"配额"，不该过限流和权限；
    但同步耗时要被计时，所以在 Observability 内侧。
 
@@ -64,15 +66,16 @@ BotError    → user_message + trace_id，日志 error
 
 ## 启动自检
 
-`preflight()` 查 bot 在目标频道的身份。Bot API 的 `channel_post` **只推给频道
-的管理员 bot** —— bot 没加进频道或被降权，Telegram 一条 update 都不推，而这个
-失败完全静默。
+`preflight()` 对 `Settings.channels` 里的每个频道查 bot 的身份。Bot API 的
+`channel_post` **只推给频道的管理员 bot** —— bot 没加进频道或被降权，Telegram
+一条 update 都不推，而这个失败完全静默。
 
 只警告不阻断：网络抖一下就拒绝启动是把可用性换成了洁癖。结论存进
-`App.channel_access`，`/health` 读它显示。
+`App.channel_access`（频道 key → 结论），`/health` 逐个频道显示。
 
-顺带校验配的 `channel_username` 和频道实际的是否一致 —— 不一致的话公开深链
-会指向错误的频道或 404。
+`preflight.channel_ok` 会把频道真实的 username 打进日志 —— 漫画频道的导出里没有
+username，部署后从这一行抄过去配 `ANIMEBOT_MANGA_CHANNEL_USERNAME`（只有
+`link_mode=public` 才用得上）。配了但对不上时打 `preflight.username_mismatch`。
 
 ## ErrorBoundary 抓不到什么
 
@@ -103,8 +106,11 @@ aiogram 把 `data` 里所有键当 kwargs 传给 handler。不做过滤的话每
 async def cmd_search(msg: Message, search: SearchService) -> None:
 ```
 
-声明什么就拿到什么。`dp["search"]`、`dp["repo"]`、`dp["registry"]`、
-`dp["settings"]`、`dp["container"]`、`dp["app"]` 都可以按名字取。
+声明什么就拿到什么。`_build_dispatcher` 把**容器里的每一项**原样放进 Dispatcher
+（再加 `settings`、`container`、`app`），所以模块 `setup()` 时自己 `put` 进容器的
+东西（如 `manga_search`）handler 一样能按名字拿到。以前这里只抄了几个写死的键，
+模块自己放的东西拿不到 —— 加 manga 时才发现，`test_build_app_wires_manga_end_to_end`
+现在盯着。
 
 ## 启动顺序里的一个坑
 

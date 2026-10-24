@@ -1,7 +1,9 @@
 # 加一个新模块
 
-以 `/bgm`（查 Bangumi）为例。真实参照物是 `src/animebot/features/system/` 和
-`features/search/`，两个都是按这套写的，没有特权。
+以 `/bgm`（查 Bangumi）为例。真实参照物是 `src/animebot/features/system/`、
+`features/search/` 和 `features/manga/`，都是按这套写的，没有特权。`manga` 是最新的
+一个，也是「模块在 `setup()` 里往容器放自己的服务、handler 按名字拿」的现成例子
+（`manga_search`）。
 
 **不需要改 `app.py`、`cli.py` 或任何已有文件。**
 
@@ -51,7 +53,7 @@ class BgmFeature(BaseFeature):
 
     async def setup(self) -> None:
         await self._client.open()
-        # 放进容器，handler 声明同名参数就能拿到
+        # 放进容器，handler 声明同名参数就能拿到（装配层把容器整个交给 Dispatcher）
         self.container.put("bgm_client", self._client, closer=self._client.close)
 
     async def teardown(self) -> None:
@@ -146,8 +148,8 @@ uv run animebot run
 
 ## 埋点该埋在哪
 
-中间件已经覆盖了「每个指令的调用数、耗时、成败」。模块自己只需要埋
-**业务语义**的点 —— 中间件不可能知道的东西：
+中间件已经覆盖了「每个指令的调用数、耗时、成败」，并且给每次交互打一条 INFO
+访问日志 `handler.done`。模块自己只需要埋**业务语义**的点 —— 中间件不可能知道的东西：
 
 ```python
 METRICS.incr("bgm.search", found=bool(items))     # 查到了没有
@@ -155,4 +157,15 @@ METRICS.observe("bgm.results", len(items))        # 返回了几条
 bind(subject_id=items[0]["id"])                   # 这次请求的业务主键
 ```
 
+`bind()` 的字段会出现在那一行 `handler.done` 里 —— **不用自己 `log.info` 一遍**。
+回调和纯文本 handler 没有指令名，记得 `bind(feature="bgm")`，否则访问日志和
+`handler.calls` 里它们归在 `feature=-` 下。
+
 不要重复埋耗时和调用数，中间件已经做了。
+
+## 如果模块要搜另一个频道
+
+频道是数据（`config.Channel`）。新频道 = 在 `Settings` 加它的 id / username、
+放进 `Settings.channels`；回填、同步、自检自动覆盖它。检索就是再建一个绑在它上面的
+`SearchService(repo, settings, channel=...)`，翻页按钮用一套新的 `PageCodec` 前缀。
+`features/manga/` 就是这么做的，见 [ADR-0013](ADR/0013-multi-channel-one-library.md)。

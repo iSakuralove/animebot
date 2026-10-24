@@ -22,6 +22,12 @@ EXPORT_PATH = Path(
 )
 CHANNEL_ID = 1702674582
 
+# 漫画频道（ACG Library 二次元图书馆）2026-10-24 的导出
+MANGA_EXPORT_PATH = Path(
+    r"C:\Users\Administrator\Downloads\Telegram Desktop\ChatExport_2026-10-24 (1)\result.json"
+)
+MANGA_CHANNEL_ID = 1659887654
+
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
@@ -29,10 +35,11 @@ def settings(tmp_path: Path) -> Settings:
         bot_token="test:token",
         channel_id=CHANNEL_ID,
         channel_username="YXHMd",
+        manga_channel_id=MANGA_CHANNEL_ID,
         link_mode="public",
         db_path=tmp_path / "test.db",
         log_dir=tmp_path / "logs",
-        features=("system", "search"),
+        features=("system", "search", "manga"),
         admin_ids=(42,),
     )
 

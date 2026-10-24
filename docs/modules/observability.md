@@ -78,16 +78,53 @@ trace_id, update_id, user_id, username, chat_id, chat_type, feature, command
 - `setup_logging()` **幂等**。多次调用只生效第一次，测试里反复 setup 不会叠加 handler
 - `get_logger(name)` 返回 `structlog.stdlib.BoundLogger`
 - `aiogram.event` / `aiohttp.access` / `asyncio` 被压到 WARNING —— 它们的 INFO 太吵
+  （aiogram 自己那条「Update id=… is handled」被我们的 `handler.done` 取代）
+- `aiogram.dispatcher` 上挂 `_TransientPollingFilter`：polling 遇到
+  `TelegramNetworkError` / `TelegramServerError` / `TelegramRetryAfter` 时那条
+  「Failed to fetch updates」从 ERROR 降为 WARNING。409 冲突、token 失效照旧 ERROR。
+  见 [ADR-0014](../ADR/0014-access-log-one-line-per-request.md)
+
+### 访问日志：一次交互一行
+
+`ObservabilityMiddleware` 给每个**被 handler 处理**的 update 打一条 INFO：
+
+```
+handler.done  command=c outcome=ok elapsed_ms=12.4 payload=进击 trace_id=ab12cd34
+              user_id=… username=… chat_type=private feature=manga
+              scope=manga query=进击 mode=lenient result_count=1 page=0 reason=prefix
+```
+
+- 前四个字段中间件自己给；trace 字段由 processor 注入；后面的业务字段是 handler
+  `bind()` 进去的。**handler 不需要自己打日志**，bind 就会出现在这一行里。
+- 超过 `slow_command_ms` 换成 WARNING `handler.slow`（同样的字段），仍然一行。
+- 没有 handler 接的 update（频道帖、群里没触发指令的消息）只打 DEBUG
+  `handler.unhandled`。频道帖由同步自己打 `sync.*`。
+- `command` / `feature` 在 handler **之后**取：回调按钮的 command 是 `cb`、纯文本
+  是 `message`，它们属于哪个模块由 handler `bind(feature=...)` 报上来。
+
+搜索类 handler 约定 bind 的字段：
+
+| 字段 | 值 |
+|---|---|
+| `scope` | `anime` / `manga` |
+| `query` | 查询词（截 80 字） |
+| `mode` | `strict`（/s）/ `lenient`（纯文本、/c） |
+| `result_count` | 命中总数（不是本页条数） |
+| `page` | 0-based |
+| `reason` | 第一条的命中层级：exact / prefix / title / alias / fuzzy / tag / none |
 
 ### 事件命名约定
 
 `<域>.<动作>`，全小写点分：
 
 ```
-handler.calls     handler.slow      handler.crash      handler.user_error
-http.ok           http.timeout      http.retryable     http.cache_hit
-feature.loaded    command.bound     app.ready          app.wired
-bot.start         bot.stopping      bot.commands_synced
+handler.done      handler.slow       handler.unhandled  handler.crash   handler.user_error
+http.ok           http.timeout       http.retryable     http.cache_hit
+feature.loaded    command.bound      app.ready          app.wired
+bot.start         bot.stopping       bot.commands_synced
+preflight.channel_ok   preflight.channel_unreachable   preflight.username_mismatch
+sync.upserted     sync.file          sync.not_post      sync.parse_failed
+manga.ready       manga.empty
 ```
 
 用固定的事件名 + 结构化字段，而不是把变量拼进消息串
@@ -154,7 +191,16 @@ grep a1b2c3d4 logs/animebot.jsonl
 一次请求的所有日志都带同一个 trace_id，包括完整栈追踪（`dict_tracebacks` 展开成
 结构化字段，不是一坨字符串）。
 
-想看哪个指令慢：`/metrics` 里 `handler.latency{command=...}` 的 p95。
+用户想要、库里没有的东西（最该补的资源清单）：
+
+```bash
+journalctl -u animebot --since "7 days ago" | grep handler.done | grep "result_count=0"
+jq -r 'select(.event=="handler.done" and .result_count==0) | [.scope,.query] | @tsv' \
+   logs/animebot.jsonl* | sort | uniq -c | sort -rn | head -30
+```
+
+想看哪个指令慢：`/metrics` 里 `handler.latency{command=...}` 的 p95，或者
+`grep handler.slow`。
 
 想看哪个指令在报错：`handler.calls{...,outcome=error}` 的计数。
 
@@ -162,4 +208,6 @@ grep a1b2c3d4 logs/animebot.jsonl
 
 [test_core.py](../../tests/test_core.py) 里的 `TestRequestContext` 和 `TestMetrics`。
 中间件层的埋点集成测试在 [test_middlewares.py](../../tests/test_middlewares.py)
-的 `TestMetricsIntegration`。
+的 `TestMetricsIntegration`。访问日志和 polling 降级在
+[test_access_log.py](../../tests/test_access_log.py)：用 `structlog.testing.capture_logs`
+带上 `_inject_trace` 跑真的中间件链，断言「一次交互正好一行、业务字段都在」。

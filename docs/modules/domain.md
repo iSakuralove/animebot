@@ -9,9 +9,10 @@
 
 | 文件 | 职责 |
 |---|---|
-| `post.py` | `Post` 模型 + `ParseStatus` |
-| `fields.py` | 字段别名表 + `normalize_key()` |
-| `links.py` | 资源链接分类（真实直链 vs 跳转表格/节点） |
+| `post.py` | `Post` 模型 + `ParseStatus` + `message_link()`（帖子和文件消息共用的深链规则） |
+| `files.py` | `ChannelFile`（频道里的一条文档消息）+ `PostFiles`（一个帖子名下的文件汇总） |
+| `fields.py` | 字段别名表 + `normalize_key()`（动漫、漫画两个频道共用一张） |
+| `links.py` | 资源链接分类（真实直链 / 跳转表格 / 官网 / 资料页）+ 按主机定种类 |
 
 字段的完整清单和覆盖率见 [data-dictionary.md](../data-dictionary.md)，
 这里只讲契约和边界。
@@ -154,12 +155,22 @@ classify_link(kind, url) ->
 `drive.google.com`（gdrive 真实文件）**不**在 docs 之列 —— 它是直链。这一条
 消除了「onedrive 到底算不算真链接」这个特殊情况：host 是唯一裁判。
 
-### categorize 返回三组
+### categorize 返回四组
 
-`categorize(links)` -> `{direct: [...], index: [...], official: [...]}`，每个元素
-`(kind, 展示名, url)`。三个键一定都在（可能是空 list），调用方不必判 KeyError。
-`direct` 组按 `_DIRECT_ORDER`（百度在前）排，展示名来自 `LINK_LABELS` —— 那是
-链接展示名的唯一真相来源，presenter 不再自己维护一份。
+`categorize(links)` -> `{direct: [...], index: [...], official: [...], info: [...]}`，
+每个元素 `(kind, 展示名, url)`。四个键一定都在（可能是空 list），调用方不必判
+KeyError。`direct` 组按 `_DIRECT_ORDER`（百度在前）排，展示名来自 `LINK_LABELS`
+—— 那是链接展示名的唯一真相来源，presenter 不再自己维护一份。
+
+`info` 组是资料页和在线阅读（`bangumi` / `online` / `web`）—— 挑书时有用，但不是
+下载。动漫列表只展示 `direct`，所以漫画带进来的 Bangumi 链接不会冒充网盘。
+
+### `kind_of_url`：标签不说指向哪里时，主机说了算
+
+「链接：」这种写法本身不带任何信息。漫画频道 788 行「链接」里 767 条指向
+bgm.tv / bangumi.tv，动漫频道那 7 行指向百度、Yandex。解析器遇到这个通用标签
+（`LINK_ALIASES` 里的 `link`）时调用 `kind_of_url(url)` 按主机定种类，认不出的
+落成 `web`。和上面「按 URL 主机判，不信标签」是同一个原则。
 
 ## 加新字段的流程
 

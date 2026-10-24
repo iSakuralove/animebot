@@ -7,6 +7,17 @@
 | 全量回填 | Telegram Desktop 导出的 `result.json` | 手动，可重跑 |
 | 增量同步 | `channel_post` / `edited_channel_post` update | bot 在线时自动 |
 
+两条路径都服务所有已配置的频道（动漫、漫画，见 `Settings.channels`）：
+
+- **回填**：`resolve_channel()` 按导出文件自己的 id 认频道，不是任何一个就拒绝。
+  同一个命令 `animebot ingest <目录>` 灌动漫或漫画都行。
+- **同步**：一个 `ChannelSync` 实例，按 `chat.id` 查表决定记到哪个频道名下。
+- **文件消息**（文档：zip/rar/7z）两条路径都走 `parse_file()` → `upsert_files()`。
+  aiogram 的 `Message.document` 由 `update_adapter` 转成导出里 `file_name` /
+  `file_size` / `mime_type` 的形状。GIF 例外：Bot API 为了向后兼容给 GIF 同时填
+  `animation` 和 `document`，adapter 照导出的做法标 `media_type=animation`，
+  `parse_file` 据此排除。
+
 ## 为什么必须有两条路径
 
 **Bot API 读不到频道历史消息。** 没有 `getChatHistory`，没有 `searchMessages`
@@ -146,32 +157,40 @@ update 会丢（停机、网络抖动、bot 被临时移出频道）。`message_
 | 帖子被删除 | Bot API **不推送删除事件**。库里留一条死记录，点进去 404。频道很少删帖，可接受 |
 | 非帖子消息 | `parse_message` 返回 `SKIPPED`，不入库，但**记 last_seen** —— 它证明 update 还在到达 |
 | 媒体组（多图） | 只有第一条带 caption，后续正文为空 → 返回 `None`，天然跳过 |
+| 纯文件（无说明文字的压缩包） | 不是帖子；记一行 `channel_files`，结果 `attached` / `file`。水位只动 `last_seen`（`last_stored` 只跟帖子走） |
+| 带说明文字的文件 | 既是帖子也是文件，两边都写；文件归它自己 |
 | 编辑只改了图 | 正文不变，upsert 写入相同内容。无害 |
 | 解析失败 | 记 `FAILED` 入库 + `warning` 日志。**不静默丢弃** |
 | 同步自己抛异常 | 中间件吞掉 + `log.exception`。同步是旁路，不能拖垮主链路 |
 | 频道帖触发 ErrorBoundary | `_reply()` 挡住 `ChatType.CHANNEL` —— 否则一次异常就会让 bot 在频道里公开发「内部错误，编号 xxx」 |
 
-## 埋点
+## 埋点与日志
 
 ```
-sync.received{kind=new|edited}
-sync.upserted{kind=...}
-sync.skipped{reason=wrong_chat|not_post|empty}
-sync.parse_failed          ← 应始终为 0，非 0 说明频道模板变了
-sync.latency{kind=...}
+sync.received{channel,kind=new|edited}
+sync.upserted{channel,kind}
+sync.file{channel,kind}       ← 频道里直接发了文件（漫画整卷）
+sync.skipped{channel,reason=not_post|empty}  /  sync.skipped{reason=wrong_chat}
+sync.parse_failed{channel}    ← 应始终为 0，非 0 说明频道模板变了
+sync.latency{channel,kind}
 ```
+
+日志事件 `sync.upserted` / `sync.file` / `sync.not_post` 都是 INFO 且带
+`channel=anime|manga` —— 频道帖不进访问日志（没有 handler 接它），这几行是
+「同步还在收到东西」唯一能在 `journalctl` 里看到的证据。
 
 `sync.parse_failed` 是新格式的早期预警。频道主改了模板，这个指标会先动。
 
-## 当前基线（1639 个真实帖子）
+## 当前基线
 
 ```
-total=2905  ok=1504  partial=135  failed=0  skipped=1266
-title_cn 100%  ·  links 98.4%  ·  tags 97.4%  ·  summary 96.6%
+动漫 1639 帖（2026-09-05）：total=2905  ok=1504  partial=135  failed=0
+漫画  938 帖（2026-10-24）：total=1257  ok=896   partial=42   failed=0   文件 271
 ```
 
-`failed=0` 是红线，[test_parser_golden.py](../../tests/test_parser_golden.py)
-盯着。
+`failed=0` 是红线，[test_parser_golden.py](../../tests/test_parser_golden.py)（动漫）
+和 [test_manga_parse.py](../../tests/test_manga_parse.py)（漫画）盯着。两份黄金
+数据集都要绿 —— 两个频道共用一张别名表，为一边加的写法不许把另一边带坏。
 
 ## 重解析不需要重导出
 

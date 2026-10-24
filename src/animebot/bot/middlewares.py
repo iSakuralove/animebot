@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
@@ -83,19 +84,28 @@ class TraceMiddleware(BaseMiddleware):
 
 
 class ObservabilityMiddleware(BaseMiddleware):
-    """计时 + 埋点 + 慢查询告警。放在错误边界内侧，异常也要被计时。"""
+    """计时 + 埋点 + 访问日志。放在错误边界内侧，异常也要被计时。
+
+    每个被 handler 处理的 update 打**一条** INFO `handler.done`：指令、结果、耗时，
+    加上 handler 用 `bind()` 补的业务字段（query / result_count / page …）。线上
+    `journalctl` 里一次交互就是一行，「谁搜了什么、搜到几条、慢不慢」不用猜。
+    超过 slow_command_ms 的换成 WARNING `handler.slow`，仍然是一行。
+
+    没有 handler 接的 update（频道帖、没触发任何指令的消息）只打 DEBUG：频道帖由
+    同步自己打 `sync.*`，再来一条是重复。
+    """
 
     def __init__(self, settings: Settings) -> None:
         self._slow_ms = settings.slow_command_ms
 
     async def __call__(self, handler: Next, event: TelegramObject, data: dict[str, Any]) -> Any:
         ctx: RequestContext | None = data.get("trace")
-        label = ctx.command if ctx and ctx.command else "unknown"
-        feature = ctx.feature if ctx and ctx.feature else "-"
         t0 = time.perf_counter()
         outcome = "ok"
+        result: Any = UNHANDLED
         try:
-            return await handler(event, data)
+            result = await handler(event, data)
+            return result
         except UserError:
             outcome = "user_error"
             raise
@@ -103,14 +113,32 @@ class ObservabilityMiddleware(BaseMiddleware):
             outcome = "error"
             raise
         finally:
-            ms = (time.perf_counter() - t0) * 1000
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            # 在 handler 之后才取：回调按钮没有指令名，它属于哪个模块只有 handler
+            # 知道（它会 bind(feature=...)）。先取的话所有回调都记成 feature=-。
+            label = (ctx.command if ctx else None) or _update_kind(event)
+            feature = ctx.feature if ctx and ctx.feature else "-"
             METRICS.incr("handler.calls", command=label, feature=feature, outcome=outcome)
             METRICS.observe("handler.latency", ms, command=label, feature=feature)
+            payload = ctx.payload if ctx else None
             if ms > self._slow_ms:
-                log.warning("handler.slow", command=label, elapsed_ms=round(ms, 1))
+                log.warning("handler.slow", command=label, outcome=outcome,
+                            elapsed_ms=ms, payload=payload)
+            elif result is not UNHANDLED or outcome != "ok":
+                log.info("handler.done", command=label, outcome=outcome,
+                         elapsed_ms=ms, payload=payload)
             else:
-                log.debug("handler.done", command=label, outcome=outcome,
-                          elapsed_ms=round(ms, 1))
+                log.debug("handler.unhandled", command=label, elapsed_ms=ms)
+
+
+def _update_kind(event: TelegramObject) -> str:
+    """没有指令名时的标签：message / channel_post / edited_channel_post …"""
+    if isinstance(event, Update):
+        for kind in ("message", "callback_query", "channel_post", "edited_channel_post",
+                     "edited_message"):
+            if getattr(event, kind, None) is not None:
+                return kind
+    return "unknown"
 
 
 class ErrorBoundary(BaseMiddleware):

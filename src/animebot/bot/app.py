@@ -42,8 +42,9 @@ class App:
     features: list[BaseFeature] = field(default_factory=list)
     bot: Bot | None = None
     dp: Dispatcher | None = None
-    #: 启动自检的结论，由 runner 填。/health 读它回答「增量同步在工作吗」。
-    channel_access: ChannelAccess | None = None
+    #: 启动自检的结论（频道 key -> 身份），由 runner 填。/health 读它回答
+    #: 「各频道的增量同步在工作吗」。
+    channel_access: dict[str, ChannelAccess] = field(default_factory=dict)
 
     async def aclose(self) -> None:
         for f in reversed(self.features):
@@ -119,11 +120,21 @@ async def build_app(settings: Settings | None = None, *, with_bot: bool = True) 
         app.dp = _build_dispatcher(settings, registry, container, app)
         for r in routers:
             app.dp.include_router(r)
-        log.info("app.ready", posts=await container.get("repo").count())
+        log.info("app.ready", **await _inventory(container.get("repo"), settings))
         return app
     except BaseException:
         await app.aclose()
         raise
+
+
+async def _inventory(repo: PostRepo, settings: Settings) -> dict[str, dict[str, int]]:
+    """每个频道库里有多少帖子 / 文件。启动日志里一眼看出「漫画频道还没回填」。"""
+    posts: dict[str, int] = {}
+    files: dict[str, int] = {}
+    for c in settings.channels:
+        posts[c.key] = await repo.count(channel_id=c.channel_id)
+        files[c.key] = await repo.file_count(channel_id=c.channel_id)
+    return {"posts": posts, "files": files}
 
 
 def _build_dispatcher(
@@ -133,14 +144,13 @@ def _build_dispatcher(
     app: App,
 ) -> Dispatcher:
     dp = Dispatcher()
-    # 依赖注入：handler 声明什么参数名就拿到什么
+    # 依赖注入：handler 声明什么参数名就拿到什么。容器里的一切原样交出去 ——
+    # 包括模块 setup() 时自己放进去的（如 manga_search），加模块不用改这里。
+    for name, obj in container.items():
+        dp[name] = obj
     dp["settings"] = settings
     dp["registry"] = registry
     dp["container"] = container
-    dp["repo"] = container.get("repo")
-    dp["search"] = container.get("search")
-    dp["sync"] = container.get("sync")
-    dp["query_store"] = container.get("query_store")
     dp["app"] = app
 
     # 顺序有意义：

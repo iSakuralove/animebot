@@ -45,6 +45,10 @@ class Container:
     def has(self, name: str) -> bool:
         return name in self._items
 
+    def items(self) -> list[tuple[str, Any]]:
+        """全部资源。装配层把它们原样交给 handler（按参数名注入），模块放进来的也算。"""
+        return list(self._items.items())
+
     def require(self, *names: str) -> None:
         """启动期校验。缺依赖要在启动时炸，不能等到用户敲指令。"""
         missing = [n for n in names if n not in self._items]

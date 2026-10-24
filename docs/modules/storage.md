@@ -1,6 +1,15 @@
 # storage —— SQLite 仓储
 
-一张主表 + 一张标签表 + 一张审计表。只依赖 `domain`。
+一张主表 + 一张标签表 + 一张文件表 + 审计表 + 水位表。只依赖 `domain`。
+
+动漫和漫画两个频道共用这些表（[ADR-0013](../ADR/0013-multi-channel-one-library.md)）。
+`channel_id` 是主键的一部分，也是每个检索查询的作用域：
+
+| 方法 | `channel_id` |
+|---|---|
+| `like_titles` / `like_fulltext` / `all_titles` / `by_tags` / `tag_cloud` | **必填**。漏传 = 串台，所以写不出来 |
+| `count` / `status_breakdown` / `file_count` | 可选。`None` 是全库合计，只给统计用 |
+| `get` / `get_many` / `file_stats` / `sync_state` / `max_message_id` | 本来就按频道定位 |
 
 ## 为什么是 SQLite
 
@@ -54,6 +63,33 @@ Telegram 自己的天然主键。
 `post_tags` 的更新是先 `DELETE` 再 `INSERT`，因为帖子编辑后标签可能减少 ——
 只 `INSERT OR IGNORE` 会留下已删除的标签。
 
+## `channel_files`：只记事实，归属现算
+
+漫画频道早期把整卷压缩包紧跟在资料帖后面发进频道（#99「进击的巨人」后面 55 个
+zip）。文件消息单独一张表，**不存它属于哪个帖子**。归属规则只写在
+`file_stats()` 的一条 SQL 里：
+
+```
+文件属于 message_id 不大于它的、最近的那个有效（ok/partial）帖子
+```
+
+- `<=` 而不是 `<`：带说明文字的文件，本身就是帖子，归它自己。
+- FAILED / 公告不算「有效帖子」，夹在中间不会把文件截走。
+- 子查询带 `channel_id`，动漫频道 #10 之后的文件不会算到漫画 #10 名下。
+
+为什么读时现算：写入时存归属的话，回填（遍历消息时记「当前帖子」）和增量（查库
+找前一个帖子）是同一条规则的两份实现。现在两条写入路径都只 `upsert_files()`
+一行事实，规则只有一处。真实数据 271 个文件、90 个帖子、零孤儿。
+
+性能：每个文件一次走主键索引的相关子查询，`f.message_id >= min(ids)` 剪掉比
+本页最早帖子还早的文件。271 个文件亚毫秒级；到几万个文件再改成存 `owner` 列。
+
+## 加表不需要迁移
+
+`CREATE TABLE IF NOT EXISTS` 对已有的库也生效 —— `channel_files` 就是这么上线的，
+线上那个只有动漫数据的库启动时自动多出这张空表。**加列**才需要迁移（或者整库
+重解析），所以新数据优先考虑「新表」或「进 JSON 列」。
+
 ## `_hydrate` 与 N+1
 
 `row_to_post()` 只还原主表字段，`tags` / `index_tags` 是空的。
@@ -69,6 +105,8 @@ Telegram 自己的天然主键。
 | `like_titles` | `search_blob` | 0.5ms | 主路径 |
 | `like_fulltext` | `search_blob` + `raw_text` | 3ms | 标题不够时兜底 |
 | `all_titles` | 只取 `title_cn` | — | 喂 rapidfuzz |
+
+三个都只扫调用方指定的那个频道。
 
 `all_titles` 故意不返回 `search_blob`：拼上英文名后长达 80+ 字符，
 `WRatio` 对长串惩罚很重，实测「无值英雄」会被「英雄时代」反超。

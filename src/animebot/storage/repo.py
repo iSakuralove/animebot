@@ -14,6 +14,7 @@ from typing import Any, Self
 import aiosqlite
 import orjson
 
+from ..domain.files import ChannelFile, PostFiles
 from ..domain.post import ParseStatus, Post
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
@@ -176,6 +177,25 @@ class PostRepo:
         await self.conn.commit()
         return len(posts)
 
+    async def upsert_files(self, files: Sequence[ChannelFile]) -> int:
+        """文件消息同样会被编辑（换文件），所以也是 upsert。"""
+        if not files:
+            return 0
+        stamp = _now()
+        await self.conn.executemany(
+            "INSERT INTO channel_files "
+            "(channel_id, message_id, file_name, file_size, mime_type, ingested_at) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(channel_id, message_id) DO UPDATE SET "
+            "file_name=excluded.file_name, file_size=excluded.file_size, "
+            "mime_type=excluded.mime_type, ingested_at=excluded.ingested_at",
+            [
+                (f.channel_id, f.message_id, f.file_name, f.file_size, f.mime_type, stamp)
+                for f in files
+            ],
+        )
+        await self.conn.commit()
+        return len(files)
+
     # ------------------------------------------------------------ 读取
     async def _hydrate(self, rows: Iterable[aiosqlite.Row]) -> list[Post]:
         """补上关联表里的 tags / index_tags，一次查询搞定，不做 N+1。"""
@@ -212,45 +232,67 @@ class PostRepo:
             return None
         return (await self._hydrate([row]))[0]
 
-    async def count(self, *, only_posts: bool = True) -> int:
-        sql = "SELECT COUNT(*) FROM posts"
-        params: tuple[Any, ...] = ()
+    async def count(self, *, only_posts: bool = True, channel_id: int | None = None) -> int:
+        """帖子数。`channel_id=None` 是全库合计 —— 只给统计用，检索永远带频道。"""
+        where: list[str] = []
+        params: list[Any] = []
         if only_posts:
-            sql += " WHERE parse_status IN (?,?)"
-            params = (ParseStatus.OK, ParseStatus.PARTIAL)
+            where.append("parse_status IN (?,?)")
+            params.extend(_ACTIVE)
+        if channel_id is not None:
+            where.append("channel_id = ?")
+            params.append(channel_id)
+        sql = "SELECT COUNT(*) FROM posts"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         async with self.conn.execute(sql, params) as cur:
             row = await cur.fetchone()
         return int(row[0]) if row else 0
 
-    async def status_breakdown(self) -> dict[str, int]:
-        async with self.conn.execute(
-            "SELECT parse_status, COUNT(*) n FROM posts GROUP BY parse_status"
-        ) as cur:
+    async def status_breakdown(self, *, channel_id: int | None = None) -> dict[str, int]:
+        sql = "SELECT parse_status, COUNT(*) n FROM posts"
+        params: tuple[Any, ...] = ()
+        if channel_id is not None:
+            sql += " WHERE channel_id = ?"
+            params = (channel_id,)
+        async with self.conn.execute(sql + " GROUP BY parse_status", params) as cur:
             return {r["parse_status"]: r["n"] async for r in cur}
 
+    async def file_count(self, *, channel_id: int | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM channel_files"
+        params: tuple[Any, ...] = ()
+        if channel_id is not None:
+            sql += " WHERE channel_id = ?"
+            params = (channel_id,)
+        async with self.conn.execute(sql, params) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------ 检索
-    async def like_titles(self, keyword: str, limit: int) -> list[Post]:
+    # 检索方法的 channel_id 是必填的关键字参数：两个频道在同一张表里，漏传一次
+    # 动漫搜索就会混进漫画帖。让「不带频道的检索」写不出来，比事后查漏可靠。
+    async def like_titles(self, keyword: str, limit: int, *, channel_id: int) -> list[Post]:
         """标题/英文名/别名的子串匹配。实测 1639 行 0.5ms，不需要 FTS5。"""
         async with self.conn.execute(
-            "SELECT * FROM posts WHERE parse_status IN (?,?) AND search_blob LIKE ? "
-            "ORDER BY posted_at DESC LIMIT ?",
-            (*_ACTIVE, f"%{keyword.lower()}%", limit),
+            "SELECT * FROM posts WHERE channel_id=? AND parse_status IN (?,?) "
+            "AND search_blob LIKE ? ORDER BY posted_at DESC LIMIT ?",
+            (channel_id, *_ACTIVE, f"%{keyword.lower()}%", limit),
         ) as cur:
             rows = await cur.fetchall()
         return await self._hydrate(rows)
 
-    async def like_fulltext(self, keyword: str, limit: int) -> list[Post]:
+    async def like_fulltext(self, keyword: str, limit: int, *, channel_id: int) -> list[Post]:
         """扩到正文（简介、staff、标签）。标题搜不到时兜底，实测 3ms。"""
         async with self.conn.execute(
-            "SELECT * FROM posts WHERE parse_status IN (?,?) "
+            "SELECT * FROM posts WHERE channel_id=? AND parse_status IN (?,?) "
             "AND (search_blob LIKE ? OR raw_text LIKE ?) "
             "ORDER BY posted_at DESC LIMIT ?",
-            (*_ACTIVE, f"%{keyword.lower()}%", f"%{keyword}%", limit),
+            (channel_id, *_ACTIVE, f"%{keyword.lower()}%", f"%{keyword}%", limit),
         ) as cur:
             rows = await cur.fetchall()
         return await self._hydrate(rows)
 
-    async def all_titles(self) -> list[tuple[int, int, str]]:
+    async def all_titles(self, *, channel_id: int) -> list[tuple[int, int, str]]:
         """(channel_id, message_id, 中文名) 全量，给 rapidfuzz 做错别字容错。
 
         故意只取 title_cn 而不是 search_blob：blob 拼上了英文名和别名后长达 80+ 字符，
@@ -258,8 +300,8 @@ class PostRepo:
         """
         async with self.conn.execute(
             "SELECT channel_id, message_id, title_cn FROM posts "
-            "WHERE parse_status IN (?,?) AND title_cn <> ''",
-            _ACTIVE,
+            "WHERE channel_id=? AND parse_status IN (?,?) AND title_cn <> ''",
+            (channel_id, *_ACTIVE),
         ) as cur:
             return [(r[0], r[1], r[2]) async for r in cur]
 
@@ -286,6 +328,7 @@ class PostRepo:
         self,
         tags: Sequence[str],
         *,
+        channel_id: int,
         kind: str = "tag",
         require_all: bool = True,
         limit: int = 50,
@@ -295,7 +338,7 @@ class PostRepo:
             return []
         ph = ",".join("?" * len(tags))
         having = "HAVING COUNT(DISTINCT t.tag) = ?" if require_all else ""
-        params: list[Any] = [*_ACTIVE, kind, *tags]
+        params: list[Any] = [channel_id, *_ACTIVE, kind, *tags]
         if require_all:
             params.append(len(tags))
         params.append(limit)
@@ -303,7 +346,7 @@ class PostRepo:
             "SELECT p.* FROM posts p "
             "JOIN post_tags t ON t.channel_id = p.channel_id "
             "AND t.message_id = p.message_id "
-            "WHERE p.parse_status IN (?,?) AND t.kind = ? "
+            "WHERE p.channel_id = ? AND p.parse_status IN (?,?) AND t.kind = ? "
             f"AND t.tag IN ({ph}) "
             "GROUP BY p.channel_id, p.message_id "
             f"{having} "
@@ -313,13 +356,45 @@ class PostRepo:
             rows = await cur.fetchall()
         return await self._hydrate(rows)
 
-    async def tag_cloud(self, kind: str = "tag", limit: int = 100) -> list[tuple[str, int]]:
+    async def tag_cloud(
+        self, kind: str = "tag", limit: int = 100, *, channel_id: int
+    ) -> list[tuple[str, int]]:
         async with self.conn.execute(
-            "SELECT tag, COUNT(*) n FROM post_tags WHERE kind=? "
-            "GROUP BY tag ORDER BY n DESC LIMIT ?",
-            (kind, limit),
+            "SELECT tag, COUNT(*) n FROM post_tags WHERE channel_id=? AND kind=? "
+            "GROUP BY tag ORDER BY n DESC, tag LIMIT ?",
+            (channel_id, kind, limit),
         ) as cur:
             return [(r[0], r[1]) async for r in cur]
+
+    async def file_stats(
+        self, channel_id: int, message_ids: Sequence[int]
+    ) -> dict[int, PostFiles]:
+        """帖子 id -> 名下文件汇总。没有文件的帖子不在返回值里。
+
+        归属规则：文件属于 message_id 不大于它的、最近的那个有效帖子（`<=` 让
+        「带说明文字的文件」归它自己）。漫画频道真实数据 272 个文件分给 90 个
+        帖子，零孤儿，文件名与帖子标题逐个对得上。
+
+        `f.message_id >= min(ids)` 是剪枝：比最小那个帖子还早的文件不可能归它们。
+        """
+        if not message_ids:
+            return {}
+        ph = ",".join("?" * len(message_ids))
+        sql = (
+            "SELECT owner, COUNT(*) AS n, SUM(file_size) AS size, MIN(message_id) AS first "
+            "FROM (SELECT f.message_id, f.file_size, "
+            "        (SELECT MAX(p.message_id) FROM posts p "
+            "          WHERE p.channel_id = f.channel_id AND p.message_id <= f.message_id "
+            "            AND p.parse_status IN (?,?)) AS owner "
+            "      FROM channel_files f WHERE f.channel_id = ? AND f.message_id >= ?) "
+            f"WHERE owner IN ({ph}) GROUP BY owner"
+        )
+        params = (*_ACTIVE, channel_id, min(message_ids), *message_ids)
+        async with self.conn.execute(sql, params) as cur:
+            return {
+                r["owner"]: PostFiles(r["n"], int(r["size"] or 0), r["first"])
+                async for r in cur
+            }
 
     # ------------------------------------------------------------ 审计
     async def start_run(self, source: str, trace_id: str = "") -> int:

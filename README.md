@@ -1,6 +1,8 @@
-# 动漫频道检索 bot
+# 动漫 / 漫画频道检索 bot
 
-在自己频道已发布的 1639 个动漫帖子上做检索：输入名字，判断发过没有，发过就给原帖链接。
+在自己频道已发布的帖子上做检索：输入名字，判断发过没有，发过就给原帖链接。
+两个频道：动漫频道（1639+ 帖，私聊直接发字 / `/s`）和漫画频道（ACG Library，
+938 帖，`/c`）。
 
 数据来源是 Telegram Desktop 的导出 JSON —— **Bot API 读不到频道历史消息**
 （没有 `getChatHistory` / `searchMessages`，那是 MTProto 的能力），所以历史帖子
@@ -16,10 +18,12 @@ uv sync
 cp .env.example .env
 ```
 
-填 `AnimeCoffeebot=<token>` 和 `ANIMEBOT_ADMIN_IDS=<你的 user_id>`，然后回填数据：
+填 `AnimeCoffeebot=<token>` 和 `ANIMEBOT_ADMIN_IDS=<你的 user_id>`，然后回填数据
+（哪个频道由导出文件自己的 id 决定，两个频道各灌一次）：
 
 ```bash
 uv run animebot ingest "C:\Users\Administrator\Downloads\Telegram Desktop\频道json数据"
+uv run animebot ingest "C:\Users\Administrator\Downloads\Telegram Desktop\ChatExport_2026-10-24 (1)"
 ```
 
 ```bash
@@ -30,10 +34,10 @@ uv run animebot run
 
 | 命令 | 用途 |
 |---|---|
-| `animebot ingest <路径>` | 从导出 JSON 全量回填，幂等 |
-| `animebot stats` | 库状态、解析成功率、标签分布、同步水位 |
+| `animebot ingest <路径>` | 从导出 JSON 全量回填，幂等；按导出里的 id 认是哪个频道 |
+| `animebot stats` | 每个频道的帖子 / 文件数、解析成功率、标签分布、同步水位 |
 | `animebot syncstat` | 增量同步诊断：update 还在到达吗、索引更新到哪 |
-| `animebot search <关键词>` | 不连 Telegram 直接搜，调试用 |
+| `animebot search <关键词> [--channel manga]` | 不连 Telegram 直接搜，调试用 |
 | `animebot commands` | 列出已注册指令，验证模块装配 |
 | `animebot run` | 启动 bot（long polling） |
 
@@ -41,7 +45,9 @@ uv run animebot run
 
 | 指令 | 说明 |
 |---|---|
-| `/search <关键词>` | 搜索。多词、错别字容错、`#标签` 筛选 |
+| 私聊直接发字 | 搜动漫。标题命中优先，打错字会纠错 |
+| `/s <关键词>` | 搜动漫，严谨模式：标题精确匹配，不猜错字 |
+| `/c <关键词>` | **搜漫画频道**。中文名 / 别名 / 日文原名、`#标签`、打错字给「名字相近」；不带词给热门标签按钮 |
 | `/check <番名>` | 只回答发过 / 没发过 |
 | `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引 |
 | `/help [指令]` | 从注册表自动生成 |
@@ -51,11 +57,12 @@ uv run animebot run
 搜索支持：
 
 ```
-/search 无职英雄          精确
-/search 无职英雄 技能      多词，命中越多排越前
-/search 咒术回站          打错字也能搜到
-/search #奇幻 #异世界      标签交集
-/search #百合 学园        标签 + 关键词
+/s 无职英雄          精确
+/s 无职英雄 技能      多词，命中越多排越前
+咒术回站             （私聊直接发）打错字也能搜到
+/s #奇幻 #异世界      标签交集
+/c 进击的巨人         漫画；结果行带作者 · 卷数 · 连载年份 · 📦频道内整卷文件
+/c #百合 #校园        漫画标签交集
 ```
 
 结果多于一页时下面出现翻页行 `⏮ ◀ 4/72 ▶ ⏭`。序号是全局连续的（第 2 页显示
@@ -86,12 +93,14 @@ src/animebot/
 │   ├── middlewares.py   trace / 错误边界 / 权限 / 限流 / 埋点 / 频道同步
 │   ├── wiring.py        @command → aiogram Router
 │   ├── loader.py        按名字动态加载模块
-│   └── preflight.py     启动自检：bot 在频道里是管理员吗
+│   ├── preflight.py     启动自检：bot 在每个频道里是管理员吗
+│   └── ui.py            翻页就地编辑（两个搜索模块共用）
 ├── features/            功能模块，加模块不改其它文件
 │   ├── system/          /help /ping /health /metrics /syncstat /trace
-│   └── search/          /search /check /tags
-├── domain/              Post 模型 + 字段别名表
-├── parsing/             帖子文本解析（不依赖 aiogram）
+│   ├── search/          动漫：私聊纯文本 /s /check /tags
+│   └── manga/           漫画：/c（落地页标签按钮、结果翻页）
+├── domain/              Post / ChannelFile 模型 + 字段别名表 + 链接分类
+├── parsing/             帖子 / 文件消息解析（不依赖 aiogram）
 ├── storage/             SQLite 仓储
 ├── search/              检索服务 + 展示层 + 分页编解码 + 高亮
 └── ingest/              导出回填 + 增量同步 + Message→导出形状转换
@@ -165,21 +174,21 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-241 个测试。两个是回归红线：
+395 个测试。三个是回归红线：
 
-- [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实帖子当
+- [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实动漫帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。
-- [test_sync.py](tests/test_sync.py) 的 `test_roundtrip_matches_export` ——
-  300 条真实消息反向构造成 aiogram Message，逐字段断言两条入口结果相同。
+- [test_manga_parse.py](tests/test_manga_parse.py) —— 938 个真实漫画帖子同理，
+  外加 271 个文件全部找得到主人。两个频道共用一张别名表，两份都要绿。
+- [test_sync.py](tests/test_sync.py) 的 `test_roundtrip_matches_export`（漫画在
+  `test_manga_parse.py`）—— 真实消息反向构造成 aiogram Message，逐字段断言两条入口
+  结果相同。
 
-基线（2026-09-05 实测）：
+基线：
 
 ```
-消息 2905  ok 1504  partial 135  failed 0  skipped 1266  帖子 1639
-
-title_cn 100.0%   links      98.4%   passwords 98.2%
-tags      97.4%   summary    96.6%   index_tags 91.3%
-episodes  90.3%   staff      90.4%   score      89.7%
+动漫（2026-09-05）消息 2905  ok 1504  partial 135  failed 0  帖子 1639
+漫画（2026-10-24）消息 1257  ok 896   partial 42   failed 0  帖子 938  文件 271
 ```
 
 ## 加新模块

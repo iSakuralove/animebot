@@ -2,27 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 import html
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 
 from ..._util import command_arg
+from ...bot.ui import safe_edit
 from ...config import Settings
 from ...core.errors import NotFound, UsageError
 from ...core.registry import command
 from ...observability.context import bind
 from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
-from ...search.callbacks import (
-    NOOP,
-    PREFIX_INLINE,
-    PREFIX_TOKEN,
-    QueryStore,
-    decode_page,
-)
+from ...search.callbacks import ANIME_PAGES, QueryStore
 from ...search.presenter import (
     detail_keyboard,
     detail_preview,
@@ -82,6 +75,7 @@ async def on_plain_text(
     query = (message.text or "").strip()
     if not query:   # 过滤器已挡掉无文本消息，这里只是防御
         return
+    bind(feature="search")   # 纯文本没有指令名，归属得自己报
     await _reply_search(message, query, search, settings, query_store, strict=False)
 
 
@@ -95,7 +89,7 @@ async def _reply_search(
     strict: bool,
 ) -> None:
     """两个入口的共同主体。差别只在查询词来源和 strict，逻辑一份。"""
-    bind(query=query[:80])
+    bind(scope="anime", query=query[:80], mode="strict" if strict else "lenient")
     page = await search.search_page(query, strict=strict)
     METRICS.incr("search.query", found=not page.is_empty)
     METRICS.observe("search.results", page.total)
@@ -127,9 +121,10 @@ async def cmd_check(
     if not query:
         raise UsageError("要查什么？", "/check 无职英雄")
 
-    bind(query=query[:80])
+    bind(scope="anime", query=query[:80])
     hit = await search.check(query)
     METRICS.incr("check.query", found=hit is not None)
+    bind(result_count=int(hit is not None))
     if hit is None:
         await message.reply(f"❌ <b>{html.escape(query)}</b> 没有发过")
         return
@@ -142,45 +137,14 @@ async def cmd_check(
 
 
 @command("tags", desc="查看标签列表", usage="/tags 或 /tags 引索", rate=(3, 20))
-async def cmd_tags(message: Message, repo: PostRepo) -> None:
+async def cmd_tags(message: Message, repo: PostRepo, settings: Settings) -> None:
     kind = "index" if command_arg(message) in ("引索", "index") else "tag"
-    cloud = await repo.tag_cloud(kind, limit=40)
+    cloud = await repo.tag_cloud(kind, limit=40, channel_id=settings.channel_id)
     if not cloud:
         raise NotFound("标签")
     title = "引索" if kind == "index" else "标签"
     body = "  ".join(f"#{html.escape(t)}<code>({n})</code>" for t, n in cloud)
     await message.reply(f"<b>{title}</b>（共 {len(cloud)} 个）\n\n{body}")
-
-
-async def _safe_edit(callback: CallbackQuery, text: str, **kw: object) -> None:
-    """原地编辑并 answer。吞掉 "not modified"（重复点同一按钮），其余照抛。
-
-    编辑而不是发新消息：翻页和进出详情都在同一条消息上完成，聊天记录不会被
-    同一次搜索的十几个版本刷屏 —— 这是用户明确要的「就地修改」。
-    """
-    if callback.message is None:
-        await callback.answer()
-        return
-
-    # answer() 和 edit_text() 无先后依赖，并发发：走代理时每次往返 ~350ms，
-    # 串行是 700ms，并发是 350ms —— 少一整个往返，且转圈立刻停。
-    #
-    # 必须 await 成 coroutine 再交给 gather：aiogram 的 .answer()/.edit_text()
-    # 返回的是 TelegramMethod 对象（pydantic model，可 await 但不是 coroutine），
-    # 直接塞进 gather 会触发 "unhashable type" —— gather 拿它当 key 而 model 无 __hash__。
-    async def _answer() -> None:
-        await callback.answer()
-
-    async def _edit() -> None:
-        await callback.message.edit_text(text, **kw)  # type: ignore[union-attr, arg-type]
-
-    _, edit_exc = await asyncio.gather(_answer(), _edit(), return_exceptions=True)
-    if isinstance(edit_exc, TelegramBadRequest):
-        # 内容没变时 Telegram 报 not modified，是重复点击，吞掉。
-        if "not modified" not in str(edit_exc).lower():
-            raise edit_exc
-    elif isinstance(edit_exc, BaseException):
-        raise edit_exc
 
 
 async def on_page(
@@ -194,11 +158,13 @@ async def on_page(
     回到列表态必须禁用链接预览 —— 从带图详情返回时，不显式关掉的话上一条
     详情的头图预览会残留。
     """
-    ref = decode_page(callback.data or "", query_store)
+    bind(feature="search", scope="anime")
+    ref = ANIME_PAGES.decode(callback.data or "", query_store)
     if ref is None:
         # token 被 LRU 淘汰了。给明确提示而不是静默失败 —— 用户重搜一次就恢复。
         await callback.answer("搜索已过期，请重新搜索", show_alert=True)
         METRICS.incr("search.page_expired")
+        bind(expired=True)
         return
 
     # 按原模式重查：严谨/宽松结果集不同，翻页不能换模式，否则串位。
@@ -206,8 +172,8 @@ async def on_page(
         ref.query, page=ref.page, strict=ref.strict
     )
     METRICS.incr("search.page_turn")
-    bind(query=ref.query[:80], page=ref.page)
-    await _safe_edit(
+    bind(query=ref.query[:80], page=ref.page, result_count=page.total)
+    await safe_edit(
         callback,
         render_page(page, settings),
         reply_markup=page_keyboard(page, query_store),
@@ -217,6 +183,7 @@ async def on_page(
 
 async def on_noop(callback: CallbackQuery) -> None:
     """页码显示和到边界的占位按钮。必须 answer，否则客户端一直转圈。"""
+    bind(feature="search")
     await callback.answer()
 
 
@@ -226,11 +193,8 @@ def register_callbacks(router: Router) -> None:
     只剩翻页（s:/t:）和占位（x）。序号详情按钮已删 —— 标题超链接直接跳原帖，
     不再需要 bot 自己渲染一份无图详情。
     """
-    router.callback_query.register(
-        on_page,
-        F.data.startswith(f"{PREFIX_INLINE}:") | F.data.startswith(f"{PREFIX_TOKEN}:"),
-    )
-    router.callback_query.register(on_noop, F.data == NOOP)
+    router.callback_query.register(on_page, F.data.func(ANIME_PAGES.owns))
+    router.callback_query.register(on_noop, F.data == ANIME_PAGES.noop)
 
 
 def register_plain_search(router: Router) -> None:

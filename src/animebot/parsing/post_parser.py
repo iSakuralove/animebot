@@ -23,14 +23,26 @@ from ..domain.fields import (
     STAFF_LOOKUP,
     normalize_key,
 )
+from ..domain.links import kind_of_url
 from ..domain.post import ParseStatus, Post
 from .text import LinkRef, flatten, hashtags, sheet_id, split_kv
 
-SUMMARY_HEADS = frozenset({"故事简介", "概况介绍", "剧情简介", "简介", "作品简介", "内容简介"})
+# STORY 是漫画频道一套英文模板的简介头（漫画 108 / 动漫 1）
+SUMMARY_HEADS = frozenset({
+    "故事简介", "概况介绍", "剧情简介", "简介", "作品简介", "内容简介", "STORY",
+})
 _SCORE = re.compile(r"^([0-9]{1,2}(?:\.[0-9]+)?)\s*(.*)$")
 _URL = re.compile(r"https?://\S+")
+_ALIAS_SPLIT = re.compile(r"[、,，/]")
 _DT_FMT = "%Y-%m-%dT%H:%M:%S"
 _EPOCH = datetime.min.replace(tzinfo=UTC)
+
+# 「别名:」下面不带 key 的续行。真实续行最长 45 字（「The invader comes from the
+# bottom of the sea!」），超过这个长度的是简介正文，不是别名。
+_ALIAS_LINE_MAX = 60
+
+# 「链接：」不说明指向哪里，种类交给 URL 主机定
+_GENERIC_LINK = "link"
 
 # 判为帖子所需的最低信号量
 _STRONG = frozenset({"title_cn", "episodes", "index", "tags", "air_date"})
@@ -81,11 +93,19 @@ def _pick_url(value: str, line_links: list[LinkRef]) -> str | None:
 def _apply_link(post: Post, canonical: str, url: str | None) -> None:
     if not url:
         return
+    if canonical == _GENERIC_LINK:
+        canonical = kind_of_url(url)
     if canonical == "sheet":
         sid = sheet_id(url)
         if sid and sid in SHARED_SHEET_IDS:
             return  # 全频道公用的汇总表，放配置里，不入库
     post.links.setdefault(canonical, url)
+
+
+def _add_aliases(post: Post, value: str) -> None:
+    for a in _ALIAS_SPLIT.split(value):
+        if (a := a.strip()) and a not in post.aliases:
+            post.aliases.append(a)
 
 
 def _apply_meta(post: Post, canonical: str, value: str) -> None:
@@ -95,7 +115,7 @@ def _apply_meta(post: Post, canonical: str, value: str) -> None:
         case "title_en":
             post.title_en = post.title_en or value
         case "title_alias":
-            post.aliases.extend(a.strip() for a in re.split(r"[、,，/]", value) if a.strip())
+            _add_aliases(post, value)
         case "episodes":
             post.episodes = post.episodes or value
         case "air_date":
@@ -115,10 +135,10 @@ def _apply_meta(post: Post, canonical: str, value: str) -> None:
             pw = value.strip()
             if pw and pw not in post.passwords:
                 post.passwords.append(pw)
-        case "extract_code" | "file_size":
-            post.extra[canonical] = value
         case _:
-            post.extra[canonical] = value
+            # 先出现的为准，和标题、话数、链接、staff 一个规矩。漫画帖会先写
+            # ISBN 再写 ISBN-10、版本连写好几行 —— 第一行是主信息。
+            post.extra.setdefault(canonical, value)
 
 
 def _apply_buttons(post: Post, msg: dict[str, Any]) -> None:
@@ -157,10 +177,14 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
     hit_fields: set[str] = set()
     summary_lines: list[str] = []
     in_summary = False
+    # 「别名: 藍色時期\n青色终止符\nBlue Period.」—— 漫画频道 46 帖把别名一行一个往下写。
+    # 续行没有 key，不收的话「Blue Period」「Medaka Box」这些名字就搜不到。
+    in_aliases = False
 
     for idx, line in enumerate(full.split("\n")):
         stripped = line.strip()
         if not stripped:
+            in_aliases = False
             if in_summary and summary_lines:
                 summary_lines.append("")
             continue
@@ -168,10 +192,15 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
         # 独立成行的「故事简介」标题
         if _is_summary_head(stripped):
             in_summary = True
+            in_aliases = False
             continue
 
         kv = split_kv(line)
         if kv is None:
+            if in_aliases and len(stripped) <= _ALIAS_LINE_MAX and not stripped.startswith("#"):
+                _add_aliases(post, stripped)
+                continue
+            in_aliases = False
             if in_summary:
                 summary_lines.append(stripped)
             elif not post.title_cn and idx <= 1 and 2 <= len(stripped) <= 120:
@@ -181,6 +210,7 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
 
         raw_key, value = kv
         key = normalize_key(raw_key)
+        in_aliases = False
 
         if key in SUMMARY_HEADS:
             in_summary = True
@@ -192,6 +222,7 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
             in_summary = False
             hit_fields.add(canonical)
             _apply_meta(post, canonical, value)
+            in_aliases = canonical == "title_alias"
         elif canonical := STAFF_LOOKUP.get(key):
             in_summary = False
             hit_fields.add(canonical)
@@ -211,6 +242,11 @@ def parse_message(msg: dict[str, Any], channel_id: int) -> Post | None:
             post.extra.setdefault(key, value)
 
     post.summary = "\n".join(summary_lines).strip()
+    if not post.title_cn and post.aliases:
+        # 漫画 #555 通篇没有中文名，第一行就是「别名: 排球!!」—— 别名就是它的名字。
+        # 旧解析器在这里把第二行「发售日: 2012-06-04」当成了标题。
+        post.title_cn = post.aliases[0]
+        post.parse_notes.append("title_from_alias")
     _apply_buttons(post, msg)
     post.parse_status = _classify(post, hit_fields)
     return post

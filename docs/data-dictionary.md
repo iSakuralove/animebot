@@ -190,14 +190,41 @@ emoji 变体：`🔐`(1249)、无(211)、`⛓`(160)、`⛓️`(43)。
 
 ## 数据库表
 
-DDL 在 [storage/schema.sql](../src/animebot/storage/schema.sql)。三张表：
+DDL 在 [storage/schema.sql](../src/animebot/storage/schema.sql)。动漫、漫画两个频道
+共用全部表，`channel_id` 区分：
 
 | 表 | 用途 |
 |---|---|
 | `posts` | 主表。list/dict 字段存 JSON 列 |
 | `post_tags` | `(channel_id, message_id, kind, tag)`，`kind` 是 `tag` 或 `index` |
+| `channel_files` | 频道里直接发的文档消息（整卷压缩包）。只记文件名/大小，归属读时现算 |
 | `ingest_runs` | 每次回填/同步的审计记录，用来发现解析成功率的回退 |
+| `sync_state` | 增量同步双水位，一个频道一行 |
 
 为什么标签单独建表而别的 list 存 JSON：标签是**查询维度**（要支持交集筛选、
 标签云、按标签统计），JSON 列做不到用索引。其它 list（aliases、passwords）
 只在展示时整体读出，没有按元素查询的需求。
+
+## 漫画频道的字段（2026-10-24，938 帖）
+
+同一个 `Post` 模型，没有为漫画加列 —— 书籍类字段落进 `extra`，用规范名而不是原文
+写法（`ISBN` 和 `ISBN-10` 都进 `extra.isbn`，先出现的为准）：
+
+| 字段 | 覆盖 | 来源写法 |
+|---|---|---|
+| `title_cn` | 938 | `中文名` / `名字` / 首行 / 第一个别名（#555） |
+| `aliases` | 753 | `别名`，含续行 |
+| `staff.original` / `staff.art` | 791 有其一 | `作者` `原作` `插图` `原案` / `作画` |
+| `staff.publisher` | — | `出版社` `其他出版社` |
+| `air_date` | 448 | `开始` `连载开始`（连载起点） |
+| `extra.end_date` | — | `结束` `连载结束` |
+| `extra.release_date` | 880 | `发售日` |
+| `extra.volumes` | 505 | `册数` |
+| `episodes` | 496 | `话数` |
+| `score` | 258 | `评分`（`☕️` `🚩` `⭐️` 前缀） |
+| `links.bangumi` | 755 | `链接: Bangumi`（按主机定种类） |
+| `links.online` | — | `在线观看`（t.me 在线阅读频道） |
+| `extra.magazine` `edition` `isbn` `pages` `price` `media_type` `imprint` `note` | — | `连载杂志` `版本` `ISBN` `页数` `价格` `类型` `书系/文库/图书品牌` `备注/其他` |
+
+文件：271 个文档消息，分属 90 个帖子。数据实测与交互见
+[design/manga-search.md](design/manga-search.md)。

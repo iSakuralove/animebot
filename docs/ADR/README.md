@@ -42,3 +42,5 @@
 | [0010](0010-pagination-state-in-callback-data.md) | 分页状态编进 callback_data | 已采纳 |
 | [0011](0011-proxy-and-internal-links.md) | 走代理连 Telegram，深链默认 internal | 已采纳 |
 | [0012](0012-title-first-search.md) | 默认搜标题，全文只在标题零命中时回退 | 已采纳 |
+| [0013](0013-multi-channel-one-library.md) | 漫画频道接入：频道是数据，一个库、channel_id 当作用域 | 已采纳 |
+| [0014](0014-access-log-one-line-per-request.md) | 每次交互一条 INFO 访问日志；polling 瞬时错误降级 | 已采纳 |

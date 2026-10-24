@@ -83,8 +83,19 @@ class Post:
         from .links import INDEX, categorize
         return categorize(self.links)[INDEX]
 
+    @property
+    def info_links(self) -> list[tuple[str, str, str]]:
+        """资料页与在线阅读：Bangumi、在线看。不是下载，漫画结果行用它。"""
+        from .links import INFO, categorize
+        return categorize(self.links)[INFO]
+
     def permalink(self, username: str | None = None) -> str:
         """公开频道用 username 深链；否则退回 /c/ 内部链接（仅成员可见）。"""
-        if username:
-            return f"https://t.me/{username.lstrip('@')}/{self.message_id}"
-        return f"https://t.me/c/{self.channel_id}/{self.message_id}"
+        return message_link(self.channel_id, self.message_id, username)
+
+
+def message_link(channel_id: int, message_id: int, username: str | None = None) -> str:
+    """频道里任意一条消息的深链。帖子和它名下的文件消息用同一个规则。"""
+    if username:
+        return f"https://t.me/{username.lstrip('@')}/{message_id}"
+    return f"https://t.me/c/{channel_id}/{message_id}"

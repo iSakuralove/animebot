@@ -18,6 +18,10 @@ Telegram 的 callback_data 上限是 **64 字节**（UTF-8 编码后），不是
 **模式位**：callback_data 里带一位 strict 标志（`s`=严谨 / `l`=宽松）。翻页时按
 原模式重查 —— 宽松模式零命中会 fuzzy 纠错出一批结果，严谨模式同样查询是空的，
 两者结果集不同，模式不带上翻页就会串位。多这 2 字节，token 形态仍远在 64 字节内。
+
+**每个频道一套前缀**（`PageCodec`）：动漫 `s:`/`t:`/`x`，漫画 `c:`/`ct:`/`cx`。翻页
+按前缀路由到各自的模块，各模块只认自己的按钮，谁也不依赖谁被加载。动漫那套是
+上线以来的老格式，聊天记录里的旧按钮还在被点 —— 只能加新前缀，不能改老的。
 """
 
 from __future__ import annotations
@@ -77,28 +81,55 @@ class QueryStore:
         return len(self._items)
 
 
+@dataclass(frozen=True, slots=True)
+class PageCodec:
+    """一套翻页按钮的 callback_data 格式。两种形态共用一个 decode()，调用方不必知道用了哪种。"""
+
+    inline: str     # <inline>:<page>:<mode>:<query>   查询词直接编进去
+    token: str      # <token>:<page>:<mode>:<token>    查询词在 QueryStore 里
+    noop: str       # 占位按钮（当前页、已到边界）
+
+    def encode(self, page: int, query: str, store: QueryStore, *, strict: bool) -> str:
+        """page + query + 模式 -> callback_data。塞得下就内联，塞不下就存表给 token。"""
+        mode = _MODE_STRICT if strict else _MODE_LENIENT
+        inline = f"{self.inline}:{page}:{mode}:{query}"
+        if len(inline.encode()) <= MAX_CALLBACK_BYTES:
+            return inline
+        return f"{self.token}:{page}:{mode}:{store.put(query)}"
+
+    def decode(self, data: str, store: QueryStore) -> PageRef | None:
+        """callback_data -> page + query + 模式。token 过期、格式不对、不是本套前缀都返回 None。"""
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            return None
+        kind, raw_page, mode, tail = parts
+        if not raw_page.isdigit() or mode not in (_MODE_STRICT, _MODE_LENIENT):
+            return None
+        page = int(raw_page)
+        strict = mode == _MODE_STRICT
+        if kind == self.inline:
+            return PageRef(page=page, query=tail, strict=strict) if tail else None
+        if kind == self.token:
+            query = store.get(tail)
+            return PageRef(page=page, query=query, strict=strict) if query else None
+        return None
+
+    def owns(self, data: str | None) -> bool:
+        """路由过滤器用：这条 callback_data 是不是本套的翻页按钮。"""
+        if not data:
+            return False
+        return data.startswith((f"{self.inline}:", f"{self.token}:"))
+
+
+ANIME_PAGES = PageCodec(inline=PREFIX_INLINE, token=PREFIX_TOKEN, noop=NOOP)
+MANGA_PAGES = PageCodec(inline="c", token="ct", noop="cx")
+
+
 def encode_page(page: int, query: str, store: QueryStore, *, strict: bool) -> str:
-    """page + query + 模式 -> callback_data。塞得下就内联，塞不下就存表给 token。"""
-    mode = _MODE_STRICT if strict else _MODE_LENIENT
-    inline = f"{PREFIX_INLINE}:{page}:{mode}:{query}"
-    if len(inline.encode()) <= MAX_CALLBACK_BYTES:
-        return inline
-    return f"{PREFIX_TOKEN}:{page}:{mode}:{store.put(query)}"
+    """动漫频道的翻页编码（老格式）。"""
+    return ANIME_PAGES.encode(page, query, store, strict=strict)
 
 
 def decode_page(data: str, store: QueryStore) -> PageRef | None:
-    """callback_data -> page + query + 模式。token 过期或格式不对返回 None。"""
-    parts = data.split(":", 3)
-    if len(parts) != 4:
-        return None
-    kind, raw_page, mode, tail = parts
-    if not raw_page.isdigit() or mode not in (_MODE_STRICT, _MODE_LENIENT):
-        return None
-    page = int(raw_page)
-    strict = mode == _MODE_STRICT
-    if kind == PREFIX_INLINE:
-        return PageRef(page=page, query=tail, strict=strict) if tail else None
-    if kind == PREFIX_TOKEN:
-        query = store.get(tail)
-        return PageRef(page=page, query=query, strict=strict) if query else None
-    return None
+    """动漫频道的翻页解码（老格式）。"""
+    return ANIME_PAGES.decode(data, store)

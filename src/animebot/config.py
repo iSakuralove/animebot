@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -17,7 +18,32 @@ ROOT = Path(__file__).resolve().parents[2]
 LinkMode = Literal["public", "internal"]
 
 # 默认启用的功能模块。加新模块 = 往这里加一个名字 + 建一个包，不动别的文件。
-DEFAULT_FEATURES = ("system", "search")
+DEFAULT_FEATURES = ("system", "search", "manga")
+
+
+@dataclass(frozen=True, slots=True)
+class Channel:
+    """一个被索引的频道。
+
+    所有频道共用一个库、一个解析器 —— 它们是同一个 up 主、同一套发帖模板。
+    channel_id 是查询维度：检索、标签云、同步水位都按它隔开。
+    """
+
+    key: str            # anime / manga：日志、埋点、/health 里用它认频道
+    title: str          # 给人看的名字
+    channel_id: int     # 导出 JSON 的形式，不带 -100 前缀
+    username: str = ""
+
+    @property
+    def bot_api_chat_id(self) -> int:
+        """Bot API 的 chat_id 需要 -100 前缀。"""
+        return int(f"-100{self.channel_id}")
+
+    def link_username(self, mode: LinkMode) -> str | None:
+        """喂给 Post.permalink()。internal 模式或没配 username 时返回 None 走 /c/ 链接。"""
+        if mode == "public" and self.username:
+            return self.username.lstrip("@")
+        return None
 
 
 class Settings(BaseSettings):
@@ -48,6 +74,12 @@ class Settings(BaseSettings):
         "https://docs.google.com/spreadsheets/d/"
         "1q2JyP3A4lok0jhkN-Tl3N3D5uo8uDJFX/edit?usp=sharing"
     )
+
+    # ---- 漫画频道（/c 搜它）----
+    # ACG Library 二次元图书馆。导出里没有 username，没配时 public 模式也退回
+    # /c/ 内部链接 —— 启动自检会把频道真实的 username 打进日志。
+    manga_channel_id: int = 1659887654
+    manga_channel_username: str = ""
 
     # ---- 功能模块 ----
     # NoDecode：这两个是 tuple（复杂类型），pydantic-settings 默认会先对 env 值
@@ -92,7 +124,7 @@ class Settings(BaseSettings):
     # 1500 会把每条正常翻页都误报成慢查询、刷满日志。直连部署后可以调回 1500。
     slow_command_ms: float = 5000.0
 
-    @field_validator("channel_id")
+    @field_validator("channel_id", "manga_channel_id")
     @classmethod
     def _strip_prefix(cls, v: int) -> int:
         """容忍误填 -1001702674582 这种 Bot API 形式。"""
@@ -100,6 +132,15 @@ class Settings(BaseSettings):
         if s.startswith("-100"):
             return int(s[4:])
         return abs(v)
+
+    @model_validator(mode="after")
+    def _distinct_channels(self) -> Self:
+        """两个频道配成同一个 id，同步会把帖子记到错的频道名下，检索结果串台。"""
+        if self.channel_id == self.manga_channel_id:
+            raise ValueError(
+                f"ANIMEBOT_CHANNEL_ID 和 ANIMEBOT_MANGA_CHANNEL_ID 都是 {self.channel_id}"
+            )
+        return self
 
     @field_validator("features", "admin_ids", mode="before")
     @classmethod
@@ -113,16 +154,30 @@ class Settings(BaseSettings):
         return v
 
     @property
+    def anime(self) -> Channel:
+        return Channel("anime", "动漫", self.channel_id, self.channel_username)
+
+    @property
+    def manga(self) -> Channel:
+        return Channel("manga", "漫画", self.manga_channel_id, self.manga_channel_username)
+
+    @property
+    def channels(self) -> tuple[Channel, ...]:
+        """所有被索引的频道。回填、同步、自检都遍历它，不认具体是哪个。"""
+        return (self.anime, self.manga)
+
+    def channel_by_id(self, channel_id: int) -> Channel | None:
+        return next((c for c in self.channels if c.channel_id == channel_id), None)
+
+    @property
     def link_username(self) -> str | None:
-        """喂给 Post.permalink()；internal 模式返回 None 走 /c/ 链接。"""
-        if self.link_mode == "public" and self.channel_username:
-            return self.channel_username.lstrip("@")
-        return None
+        """动漫频道的深链 username；internal 模式返回 None 走 /c/ 链接。"""
+        return self.anime.link_username(self.link_mode)
 
     @property
     def bot_api_chat_id(self) -> int:
-        """Bot API 的 chat_id 需要 -100 前缀，copyMessage/forwardMessage 用这个。"""
-        return int(f"-100{self.channel_id}")
+        """动漫频道的 Bot API chat_id（带 -100 前缀）。"""
+        return self.anime.bot_api_chat_id
 
 
 @lru_cache(maxsize=1)

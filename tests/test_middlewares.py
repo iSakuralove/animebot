@@ -21,6 +21,7 @@ from animebot.bot.middlewares import (
     RateLimitMiddleware,
     TraceMiddleware,
 )
+from animebot.config import AdminStore
 from animebot.core.errors import UsageError
 from animebot.core.registry import CommandRegistry, command, spec_of
 from animebot.observability.context import RequestContext
@@ -83,7 +84,9 @@ def build_dp(registry: CommandRegistry, router: Router, settings) -> Dispatcher:
     for mw in (
         TraceMiddleware(registry),
         ErrorBoundary(),
-        AccessMiddleware(registry, settings.admin_ids),
+        AccessMiddleware(
+            registry, AdminStore(settings.admin_ids, settings.db_path.parent / "admins.env")
+        ),
         RateLimitMiddleware(registry),
         ObservabilityMiddleware(settings),
     ):
@@ -412,8 +415,13 @@ class TestAdminVisibility:
 
         monkeypatch.setattr(type(fake_bot), "__call__", fake_call, raising=True)
 
+        from animebot.config import AdminStore
+        from animebot.core.container import Container
+
         cfg = settings.model_copy(update={"admin_ids": (ADMIN_ID,)})
-        app = t.SimpleNamespace(bot=fake_bot, registry=reg, settings=cfg)
+        container = Container(cfg)
+        container.put("admins", AdminStore((ADMIN_ID,), settings.db_path.parent / "admins.env"))
+        app = t.SimpleNamespace(bot=fake_bot, registry=reg, settings=cfg, container=container)
         await sync_bot_commands(app)
 
         set_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]

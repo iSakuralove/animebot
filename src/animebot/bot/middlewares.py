@@ -16,7 +16,7 @@ from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.enums import ChatType
 from aiogram.types import CallbackQuery, Message, TelegramObject, Update
 
-from ..config import Settings
+from ..config import AdminStore, Settings
 from ..core.errors import BotError, PermissionDenied, RateLimited, UserError
 from ..core.registry import CommandRegistry, CommandSpec
 from ..ingest.sync import ChannelSync
@@ -241,11 +241,15 @@ class RateLimitMiddleware(BaseMiddleware):
 
 
 class AccessMiddleware(BaseMiddleware):
-    """权限与场景校验：admin_only、group_allowed。"""
+    """权限与场景校验：admin_only、group_allowed。
 
-    def __init__(self, registry: CommandRegistry, admin_ids: tuple[int, ...]) -> None:
+    admin_ids 读的是 AdminStore（运行时可变，/admins 增删立即生效），
+    不是启动时的快照。
+    """
+
+    def __init__(self, registry: CommandRegistry, admins: AdminStore) -> None:
         self._registry = registry
-        self._admins = frozenset(admin_ids)
+        self._admins = admins
 
     async def __call__(self, handler: Next, event: TelegramObject, data: dict[str, Any]) -> Any:
         ctx: RequestContext | None = data.get("trace")

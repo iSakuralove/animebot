@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -183,3 +184,66 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+class AdminStore:
+    """管理员 id 的运行时真相 + .env 持久化。
+
+    为什么不直接改 Settings：pydantic 实例是启动时的一份快照，AccessMiddleware
+    拿着的 frozenset 更是快照的快照 —— 在快照上改，改一百次也不生效。这里是
+    一份可变状态：改内存立即生效（不用重启），同时把 `ANIMEBOT_ADMIN_IDS=` 那行
+    原子写回 .env，重启后由 Settings 读回同一份。
+
+    只做机械的增删和落盘，「至少保留一个」这类策略在 handler 里判。
+    """
+
+    def __init__(self, ids: Iterable[int], env_path: Path) -> None:
+        self._ids: list[int] = list(dict.fromkeys(int(i) for i in ids))
+        self._path = Path(env_path)
+
+    @property
+    def ids(self) -> tuple[int, ...]:
+        return tuple(self._ids)
+
+    def __contains__(self, uid: int) -> bool:
+        return uid in self._ids
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def add(self, uid: int) -> bool:
+        """已存在返回 False（幂等，不重写 .env）。"""
+        if uid in self._ids:
+            return False
+        self._ids.append(uid)
+        self._persist()
+        return True
+
+    def remove(self, uid: int) -> bool:
+        """不存在返回 False。存在则删除并落盘。"""
+        if uid not in self._ids:
+            return False
+        self._ids.remove(uid)
+        self._persist()
+        return True
+
+    def _persist(self) -> None:
+        """替换 .env 里的 ANIMEBOT_ADMIN_IDS= 行；没有就追加。先写临时文件再原子换名。"""
+        key = "ANIMEBOT_ADMIN_IDS"
+        line = f"{key}={','.join(str(i) for i in self._ids)}"
+        lines = (
+            self._path.read_text(encoding="utf-8").splitlines()
+            if self._path.exists() else []
+        )
+        out, replaced = [], False
+        for ln in lines:
+            if ln.startswith(f"{key}="):
+                out.append(line)
+                replaced = True
+            else:
+                out.append(ln)
+        if not replaced:
+            out.append(line)
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        tmp.replace(self._path)

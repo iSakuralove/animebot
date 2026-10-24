@@ -151,7 +151,7 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 只有两种角色，不做更细的（「指定用户可用的指令」= 把 user_id 加进管理员列表）：
 
 - **普通用户** —— 私聊直接发字搜索、`/s` `/c` `/help`（各自有限流；其余指令对他们返回「没有权限」）
-- **管理员**（`ANIMEBOT_ADMIN_IDS`，CSV）—— 额外有 `/check` `/tags` `/ping` `/trace` `/health` `/metrics` `/syncstat`
+- **管理员**（`ANIMEBOT_ADMIN_IDS`，CSV）—— 额外有 `/check` `/tags` `/ping` `/trace` `/health` `/metrics` `/syncstat`，以及 `/admins` 远程增删查管理员名单（改内存立即生效 + 写回 `.env` 重启仍在；不许删到最后一个）
 
 权限、限流、群聊限制都由中间件统一执行（[ADR-0001](ADR/0001-metadata-only-decorator.md)），
 `@command` 声明即生效；写新指令的人不可能漏一层保护。当前划分钉在

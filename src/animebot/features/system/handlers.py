@@ -5,20 +5,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import html
 import platform
 import sys
 import time
 
-from aiogram.types import Message
+from aiogram import Bot
+from aiogram.types import BotCommandScopeChat, Message
 
 from ... import __version__
 from ..._util import command_arg, human_duration
-from ...config import Settings
-from ...core.errors import NotFound
+from ...config import AdminStore, Settings
+from ...core.errors import NotFound, UsageError, UserError
 from ...core.registry import CommandRegistry, command
 from ...ingest.sync import ChannelSync
-from ...observability.context import RequestContext
+from ...observability.context import RequestContext, bind
 from ...observability.metrics import METRICS
 from ...storage.repo import PostRepo
 
@@ -182,6 +184,70 @@ async def cmd_syncstat(message: Message, sync: ChannelSync, settings: Settings) 
             f"累计: 收到 {r['seen_count']} 条 / 入库 {r['stored_count']} 条"
         )
     await message.reply("\n".join(blocks))
+
+
+@command(
+    "admins",
+    desc="管理员名单：查看 / add / del",
+    usage="/admins 或 /admins add|del <user_id>",
+    admin_only=True,
+    group_allowed=False,      # 名单是数字 id，不该出现在群里
+    rate=(6, 20),
+    long_help=(
+        "/admins               当前管理员 id\n"
+        "/admins add 123456    添加（立即生效，重启后仍在）\n"
+        "/admins del 123456    删除（至少保留一个）\n"
+        "\n"
+        "user_id 是 Telegram 数字 id。不知道 id：让对方给 bot 随便发条消息，"
+        "然后看 journalctl 里的 user_id=，或让对方跟 @userinfobot 对话。"
+    ),
+)
+async def cmd_admins(
+    message: Message,
+    admins: AdminStore,
+    registry: CommandRegistry,
+    bot: Bot,
+) -> None:
+    """远程增删查管理员。改的是 AdminStore（立即生效）+ .env（重启仍在）。
+
+    能加就能删、能删就能把自己删掉 —— 唯一的护栏是不许删空：全删了没人能
+    进后台，只能 SSH 修 .env。加人后立刻推一份含专用指令的私聊菜单。
+    """
+    args = command_arg(message).split()
+    if not args:
+        ids = "、".join(str(i) for i in admins.ids)
+        await message.reply(f"管理员（{len(admins)}）: {ids}")
+        return
+
+    action, *rest = args
+    if action not in ("add", "del") or len(rest) != 1 or not rest[0].isdigit():
+        raise UsageError("参数不对", "/admins add 123456")
+    uid = int(rest[0])
+    bind(admin_action=action, target_id=uid, admin_count=len(admins))
+
+    if action == "add":
+        if not admins.add(uid):
+            await message.reply(f"{uid} 已经是管理员了")
+            return
+        from ...bot.app import push_admin_menus
+        # 对方还没跟 bot 说过话时 chat 不存在，推菜单会 400 —— 提示一句，等下次重启补
+        pushed = await push_admin_menus(bot, registry, (uid,))
+        note = "" if pushed else "\n（他还没跟 bot 说过话，专用指令菜单等下次重启再推）"
+        await message.reply(f"✅ 已添加 {uid}，当前 {len(admins)} 个管理员{note}")
+        return
+
+    if uid not in admins:
+        await message.reply(f"{uid} 不在管理员名单里")
+        return
+    if len(admins) == 1:
+        raise UserError(
+            "至少保留一个管理员 —— 全删了就没人能进后台了。要换人：先 add 新的，再 del 旧的。"
+        )
+    admins.remove(uid)
+    # 顺手清掉他私聊里的专用指令菜单（best-effort，失败不影响删除本身）
+    with contextlib.suppress(Exception):
+        await bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=uid))
+    await message.reply(f"✅ 已删除 {uid}，当前 {len(admins)} 个管理员")
 
 
 @command("metrics", desc="运行指标", admin_only=True)

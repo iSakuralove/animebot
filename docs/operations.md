@@ -51,6 +51,27 @@ uv run python -m animebot run
    `username=` 就是频道 username，`link_mode=public` 时抄进
    `ANIMEBOT_MANGA_CHANNEL_USERNAME`。
 
+## 远程管理管理员名单（本机脚本）
+
+在自己电脑上（Windows 用 Git Bash）跑 `scripts/vps-admins.sh`，直接改 VPS `.env`
+里的 `ANIMEBOT_ADMIN_IDS` 并重启生效：
+
+```bash
+ANIMEBOT_VPS=root@<vps> scripts/vps-admins.sh list
+ANIMEBOT_VPS=root@<vps> scripts/vps-admins.sh add 123456
+ANIMEBOT_VPS=root@<vps> scripts/vps-admins.sh del 123456
+```
+
+- VPS 地址从 `ANIMEBOT_VPS` 环境变量读（不进公开仓库），部署目录可用
+  `ANIMEBOT_VPS_DIR` 覆盖（默认 `/root/animebot`）。实际地址见 `CLAUDE.local.md`。
+- `list` 只读；`add`/`del` 改完 `.env` 自动 `systemctl restart animebot`。
+- 幂等提示：重复 add、删不存在的 id 都只回一句话，不动文件。
+- **拒绝删到最后一个** —— 全删了没人能进后台。要换人：先 add 新的再 del 旧的。
+- 拿别人的 user_id：让对方给 bot 随便发条消息，`journalctl` 里 `user_id=` 就有。
+- 前提是本机到 VPS 免密 SSH；systemd 单元没配任何 `ANIMEBOT_*` 环境变量
+  （已核对），`.env` 是唯一真相 —— 若哪天加了 `Environment=ANIMEBOT_ADMIN_IDS=...`，
+  环境变量会盖过 `.env`，这个脚本的改法就失效了。
+
 ## 看日志
 
 线上验证只有 `journalctl` 一个窗口，所以日志按「一次交互一行」设计

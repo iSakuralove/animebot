@@ -21,7 +21,7 @@ from animebot.bot.middlewares import (
     RateLimitMiddleware,
     TraceMiddleware,
 )
-from animebot.config import AdminStore, Settings
+from animebot.config import Settings
 from animebot.core.registry import CommandRegistry, command, spec_of
 from animebot.ingest.sync import ChannelSync
 from animebot.storage.repo import PostRepo
@@ -89,9 +89,7 @@ def build_dp(
     for mw in (
         TraceMiddleware(registry),
         ErrorBoundary(),
-        AccessMiddleware(
-            registry, AdminStore(settings.admin_ids, settings.db_path.parent / "admins.env")
-        ),
+        AccessMiddleware(registry, settings.admin_ids),
         RateLimitMiddleware(registry),
         ObservabilityMiddleware(settings),
         ChannelSyncMiddleware(sync),

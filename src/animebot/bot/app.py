@@ -11,7 +11,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
-from ..config import ROOT, AdminStore, Settings, get_settings
+from ..config import Settings, get_settings
 from ..core.container import Container
 from ..core.errors import ConfigError
 from ..core.feature import BaseFeature
@@ -68,8 +68,6 @@ async def build_container(settings: Settings) -> Container:
     c.put("sync", ChannelSync(repo, settings))
     # 超长查询词的暂存。有界 LRU，丢了只会让翻页提示"搜索已过期"。
     c.put("query_store", QueryStore(capacity=settings.query_store_size))
-    # 管理员名单的运行时真相：/admins 增删它，AccessMiddleware 读它。
-    c.put("admins", AdminStore(settings.admin_ids, ROOT / ".env"))
     return c
 
 
@@ -166,7 +164,7 @@ def _build_dispatcher(
     for mw in (
         TraceMiddleware(registry),
         ErrorBoundary(),
-        AccessMiddleware(registry, container.get("admins")),
+        AccessMiddleware(registry, settings.admin_ids),
         RateLimitMiddleware(registry),
         ObservabilityMiddleware(settings),
         ChannelSyncMiddleware(container.get("sync")),
@@ -192,32 +190,26 @@ async def sync_bot_commands(app: App) -> None:
 
     两层 scope：默认 scope 是全员可见的成员指令；每个管理员再单独推一份含
     admin_only 指令的菜单（BotCommandScopeChat 只影响那个私聊）—— 否则管理员
-    也看不见自己的指令，只能手打。
+    也看不见自己的指令，只能手打。管理员还没跟 bot 说过话时 chat 不存在，
+    set 会 400：跳过打个 warning，等下次重启再补。
     """
     if app.bot is None:
         return
     member_menu = _menu_items(app.registry, for_admin=False)
     await app.bot.set_my_commands(member_menu, scope=BotCommandScopeDefault())
-    admins: AdminStore = app.container.get("admins")
-    pushed = await push_admin_menus(app.bot, app.registry, admins.ids)
-    log.info("bot.commands_synced", member=len(member_menu), menus=pushed + 1)
-
-
-async def push_admin_menus(bot: Bot, registry: CommandRegistry, admin_ids: tuple[int, ...]) -> int:
-    """给每个管理员推含专用指令的私聊菜单，返回成功个数。
-
-    管理员还没跟 bot 说过话时 chat 不存在，set 会 400：跳过打个 warning，
-    等下次重启（或 /admins add 之后他第一次说话时）再补。/admins 增删也走这里。
-    """
-    menu = _menu_items(registry, for_admin=True)
-    pushed = 0
-    for admin_id in admin_ids:
-        try:
-            await bot.set_my_commands(menu, scope=BotCommandScopeChat(chat_id=admin_id))
-            pushed += 1
-        except TelegramAPIError as exc:
-            log.warning("bot.admin_menu_failed", admin_id=admin_id, detail=str(exc)[:120])
-    return pushed
+    pushed = 1
+    if app.settings.admin_ids:
+        admin_menu = _menu_items(app.registry, for_admin=True)
+        for admin_id in app.settings.admin_ids:
+            try:
+                await app.bot.set_my_commands(
+                    admin_menu, scope=BotCommandScopeChat(chat_id=admin_id)
+                )
+                pushed += 1
+            except TelegramAPIError as exc:
+                log.warning("bot.admin_menu_failed", admin_id=admin_id,
+                            detail=str(exc)[:120])
+    log.info("bot.commands_synced", member=len(member_menu), menus=pushed)
 
 
 # 增量同步靠中间件而不是 handler（理由见 ChannelSyncMiddleware 的 docstring），

@@ -51,7 +51,7 @@ uv run animebot run
 | `/check <番名>` | 只回答发过 / 没发过（管理员） |
 | `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引（管理员） |
 | `/help [指令]` | 从注册表自动生成 |
-| `/health` `/metrics` `/syncstat` `/ping` `/trace` `/check` `/tags` `/admins` | 管理员专用（`ANIMEBOT_ADMIN_IDS`） |
+| `/health` `/metrics` `/syncstat` `/ping` `/trace` `/check` `/tags` | 管理员专用（`ANIMEBOT_ADMIN_IDS`） |
 
 搜索支持：
 

@@ -51,23 +51,6 @@ uv run python -m animebot run
    `username=` 就是频道 username，`link_mode=public` 时抄进
    `ANIMEBOT_MANGA_CHANNEL_USERNAME`。
 
-## 远程管理管理员名单
-
-`/admins`（管理员专用、仅私聊）：不带参数列出名单；`add <user_id>` / `del <user_id>`
-增删。改动**立即生效**（AccessMiddleware 读的是运行时的 `AdminStore`，不是启动快照），
-同时原子写回 `.env` 的 `ANIMEBOT_ADMIN_IDS=` 行，重启后仍在。
-
-- 加人后立刻给他推含专用指令的私聊菜单；他还没跟 bot 说过话时推不上去
-  （chat 不存在），回复里会说明，等下次重启补。
-- 删人时顺手清掉他的菜单（best-effort）。
-- **不许删到最后一个** —— 全删了没人能进后台，只能 SSH 修 `.env`。要换人：
-  先 `add` 新的再 `del` 旧的。
-- 拿别人的 user_id：让对方给 bot 随便发条消息，`journalctl` 里 `user_id=`
-  就有；或让对方跟 @userinfobot 对话。
-- systemd 单元没配任何 `ANIMEBOT_*` 环境变量（已核对），`.env` 是唯一真相，
-  写它就够 —— 若哪天给单元加了 `Environment=ANIMEBOT_ADMIN_IDS=...`，
-  环境变量会盖过 `.env`，这个功能的持久化就失效了。
-
 ## 看日志
 
 线上验证只有 `journalctl` 一个窗口，所以日志按「一次交互一行」设计

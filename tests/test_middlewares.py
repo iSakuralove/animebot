@@ -357,3 +357,73 @@ class TestCommandPolicy:
             spec = spec_of(fn)
             assert spec is not None
             assert not spec.admin_only, f"/{spec.name} 是给频道成员用的，不该 admin_only"
+
+
+class TestAdminVisibility:
+    """管理员要能「看见」自己的专用指令：/help 列表 + 输入框菜单。
+
+    权限本身早已由 admin_only 保证，这里测的是可见性 —— 菜单对全员隐藏
+    admin_only 指令是给普通用户的，不该把管理员一起挡在外面。
+    """
+
+    async def test_help_shows_admin_section_to_admin_only(
+        self, settings, rec: Recorder, fake_bot: Bot
+    ) -> None:
+        from animebot.features.system.handlers import cmd_help, cmd_ping
+
+        reg = CommandRegistry()
+        dp = build_dp(reg, wire(reg, cmd_help, cmd_ping), settings)
+        await dp.feed_update(bot=fake_bot, update=make_update("/help"))          # 普通用户
+        await dp.feed_update(
+            bot=fake_bot, update=make_update("/help", user_id=ADMIN_ID)          # 管理员
+        )
+        normal, admin = rec.replies[-2], rec.replies[-1]
+        assert "/ping" not in normal, "普通用户不该看到专用指令"
+        assert "/ping" in admin and "🔒" in admin, "管理员要能看到专用指令（带 🔒）"
+
+    async def test_menu_scopes(
+        self, settings, fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """默认菜单只含成员指令；每个管理员单独推一份含 admin_only 的菜单。"""
+        import types as t
+
+        from aiogram.types import BotCommandScopeChat, BotCommandScopeDefault
+
+        from animebot.bot.app import sync_bot_commands
+
+        @command("open_cmd", desc="成员用")
+        async def open_cmd(message: Message) -> None: ...
+
+        @command("adm_cmd", desc="管理员用", admin_only=True)
+        async def adm_cmd(message: Message) -> None: ...
+
+        @command("dbg", desc="调试", hidden=True, admin_only=True)
+        async def dbg(message: Message) -> None: ...
+
+        reg = CommandRegistry()
+        from animebot.bot.wiring import bind_commands
+        bind_commands(Router(), [spec_of(open_cmd), spec_of(adm_cmd), spec_of(dbg)], reg, "t")
+
+        calls: list[object] = []
+
+        async def fake_call(self: Bot, method: object, **_kw: object) -> object:
+            calls.append(method)
+            return True
+
+        monkeypatch.setattr(type(fake_bot), "__call__", fake_call, raising=True)
+
+        cfg = settings.model_copy(update={"admin_ids": (ADMIN_ID,)})
+        app = t.SimpleNamespace(bot=fake_bot, registry=reg, settings=cfg)
+        await sync_bot_commands(app)
+
+        set_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]
+        assert len(set_calls) == 2, "默认 scope 一份 + 管理员私聊一份"
+
+        default = next(c for c in set_calls
+                       if isinstance(c.scope, BotCommandScopeDefault))
+        admin = next(c for c in set_calls
+                     if isinstance(c.scope, BotCommandScopeChat))
+        assert admin.scope.chat_id == ADMIN_ID
+        assert [b.command for b in default.commands] == ["open_cmd"]
+        assert [b.command for b in admin.commands] == ["open_cmd", "adm_cmd"], \
+            "管理员多看到 admin_only，hidden 的对谁都不进菜单"

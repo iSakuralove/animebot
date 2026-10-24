@@ -8,7 +8,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, BotCommandScopeDefault
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 
 from ..config import Settings, get_settings
 from ..core.container import Container
@@ -172,17 +173,43 @@ def _build_dispatcher(
     return dp
 
 
+def _menu_items(registry: CommandRegistry, *, for_admin: bool) -> list[BotCommand]:
+    """指令菜单条目。成员看 visible()；管理员额外看非隐藏的 admin_only 指令。
+
+    hidden 的（/trace）对谁都不进菜单 —— 输入框自动补全里也不该有调试指令。
+    """
+    return [
+        BotCommand(command=s.name, description=s.desc or s.name)
+        for s in registry
+        if not s.hidden and (for_admin or not s.admin_only)
+    ]
+
+
 async def sync_bot_commands(app: App) -> None:
-    """把注册表推到 Telegram 的指令菜单。加指令不需要手动去 BotFather 改。"""
+    """把注册表推到 Telegram 的指令菜单。加指令不需要手动去 BotFather 改。
+
+    两层 scope：默认 scope 是全员可见的成员指令；每个管理员再单独推一份含
+    admin_only 指令的菜单（BotCommandScopeChat 只影响那个私聊）—— 否则管理员
+    也看不见自己的指令，只能手打。管理员还没跟 bot 说过话时 chat 不存在，
+    set 会 400：跳过打个 warning，等下次重启再补。
+    """
     if app.bot is None:
         return
-    cmds = [
-        BotCommand(command=s.name, description=s.desc or s.name)
-        for s in app.registry.visible()
-    ]
-    if cmds:
-        await app.bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
-        log.info("bot.commands_synced", count=len(cmds))
+    member_menu = _menu_items(app.registry, for_admin=False)
+    await app.bot.set_my_commands(member_menu, scope=BotCommandScopeDefault())
+    pushed = 1
+    if app.settings.admin_ids:
+        admin_menu = _menu_items(app.registry, for_admin=True)
+        for admin_id in app.settings.admin_ids:
+            try:
+                await app.bot.set_my_commands(
+                    admin_menu, scope=BotCommandScopeChat(chat_id=admin_id)
+                )
+                pushed += 1
+            except TelegramAPIError as exc:
+                log.warning("bot.admin_menu_failed", admin_id=admin_id,
+                            detail=str(exc)[:120])
+    log.info("bot.commands_synced", member=len(member_menu), menus=pushed)
 
 
 # 增量同步靠中间件而不是 handler（理由见 ChannelSyncMiddleware 的 docstring），

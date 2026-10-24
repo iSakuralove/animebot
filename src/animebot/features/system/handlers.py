@@ -32,14 +32,21 @@ _BOOT = time.time()
     aliases=("start", "h"),
     long_help="不带参数列出全部指令；带指令名看该指令的详细用法。",
 )
-async def cmd_help(message: Message, registry: CommandRegistry) -> None:
+async def cmd_help(
+    message: Message, registry: CommandRegistry, is_admin: bool = False
+) -> None:
+    """is_admin 由 AccessMiddleware 从 admin_ids 算好注入 —— 管理员额外看到
+    🔒 标记的专用指令，普通用户的列表里它们不存在。"""
     arg = command_arg(message)
 
     if arg:
         spec = registry.get(arg)
         if spec is None:
             raise NotFound(f"指令 /{html.escape(arg)}")
-        lines = [f"<b>/{spec.name}</b> — {html.escape(spec.desc or '（无说明）')}"]
+        title = f"/{spec.name}"
+        if spec.admin_only:
+            title += "（管理员专用）"
+        lines = [f"<b>{title}</b> — {html.escape(spec.desc or '（无说明）')}"]
         if spec.aliases:
             lines.append("别名: " + ", ".join(f"/{a}" for a in spec.aliases))
         lines.append(f"用法: <code>{html.escape(spec.usage)}</code>")
@@ -53,12 +60,17 @@ async def cmd_help(message: Message, registry: CommandRegistry) -> None:
 
     blocks: list[str] = ["<b>可用指令</b>"]
     for feature, specs in registry.by_feature().items():
-        visible = [s for s in specs if not s.hidden and not s.admin_only]
-        if not visible:
+        # hidden 对谁都不列；admin_only 只对管理员列，带 🔒 前缀
+        shown = [
+            s for s in specs
+            if not s.hidden and (is_admin or not s.admin_only)
+        ]
+        if not shown:
             continue
         blocks.append(f"\n<i>{html.escape(feature)}</i>")
         blocks.extend(
-            f"/{s.name} — {html.escape(s.desc or '')}" for s in visible
+            ("🔒 " if s.admin_only else "") + f"/{s.name} — {html.escape(s.desc or '')}"
+            for s in shown
         )
     blocks.append("\n<code>/help &lt;指令&gt;</code> 看详细用法")
     await message.reply("\n".join(blocks))

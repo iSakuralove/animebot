@@ -40,8 +40,8 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 | 全量回填 | 从导出 JSON 灌库，幂等，带频道 id 校验 |
 | 增量同步 | `channel_post` + `edited_channel_post` 实时入库，与回填共用解析器 |
 | `/search` | 多词、错别字容错、`#标签` 筛选、**分页 + 关键词高亮**；结果页可一键切到漫画结果（`📚 漫画`，空结果也有） |
-| `/check` | 只回答发过 / 没发过 |
-| `/tags` | 标签列表 + 拼音首字母索引 |
+| `/check` | 只回答发过 / 没发过（管理员） |
+| `/tags` | 标签列表 + 拼音首字母索引（管理员专用） |
 | `/c` | **漫画频道**（ACG Library，938 帖）检索：标题 / 别名、标签、错字纠错（标明「名字相近」）、分页；结果行带作者 · 卷数 · 连载年份 · 📦频道内整卷文件；不带词时给热门标签按钮。见 [design/manga-search.md](design/manga-search.md) |
 | `/help` | 从注册表自动生成，加指令不用手写帮助 |
 | `/ping` `/trace` | 测活、看本次请求的追踪信息 |
@@ -150,11 +150,12 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 
 只有两种角色，不做更细的（「指定用户可用的指令」= 把 user_id 加进管理员列表）：
 
-- **普通用户** —— `/search` `/check` `/tags` `/c` `/help`（各自有限流；运维指令对他们返回「没有权限」）
-- **管理员**（`ANIMEBOT_ADMIN_IDS`，CSV）—— 额外有 `/ping` `/trace` `/health` `/metrics` `/syncstat`
+- **普通用户** —— 私聊直接发字搜索、`/s` `/c` `/help`（各自有限流；其余指令对他们返回「没有权限」）
+- **管理员**（`ANIMEBOT_ADMIN_IDS`，CSV）—— 额外有 `/check` `/tags` `/ping` `/trace` `/health` `/metrics` `/syncstat`
 
 权限、限流、群聊限制都由中间件统一执行（[ADR-0001](ADR/0001-metadata-only-decorator.md)），
-`@command` 声明即生效；写新指令的人不可能漏一层保护。
+`@command` 声明即生效；写新指令的人不可能漏一层保护。当前划分钉在
+`test_middlewares.py::TestCommandPolicy` 里，改策略先改测试。
 
 ## 非功能要求
 

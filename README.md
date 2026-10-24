@@ -48,10 +48,10 @@ uv run animebot run
 | 私聊直接发字 | 搜动漫。标题命中优先，打错字会纠错 |
 | `/s <关键词>` | 搜动漫，严谨模式：标题精确匹配，不猜错字 |
 | `/c <关键词>` | **搜漫画频道**。中文名 / 别名 / 日文原名、`#标签`、打错字给「名字相近」；不带词给热门标签按钮 |
-| `/check <番名>` | 只回答发过 / 没发过 |
-| `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引 |
+| `/check <番名>` | 只回答发过 / 没发过（管理员） |
+| `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引（管理员） |
 | `/help [指令]` | 从注册表自动生成 |
-| `/health` `/metrics` `/syncstat` `/ping` `/trace` | 管理员专用（`ANIMEBOT_ADMIN_IDS`） |
+| `/health` `/metrics` `/syncstat` `/ping` `/trace` `/check` `/tags` | 管理员专用（`ANIMEBOT_ADMIN_IDS`） |
 
 搜索支持：
 

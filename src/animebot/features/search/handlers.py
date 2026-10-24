@@ -122,6 +122,7 @@ async def _reply_search(
     desc="判断某部番发过没有",
     usage="/check 无职英雄",
     rate=(6, 20),
+    admin_only=True,
     long_help="只回答发过 / 没发过，发过就给原帖链接。",
 )
 async def cmd_check(
@@ -148,7 +149,9 @@ async def cmd_check(
     )
 
 
-@command("tags", desc="查看标签列表", usage="/tags 或 /tags 引索", rate=(3, 20))
+@command(
+    "tags", desc="查看标签列表", usage="/tags 或 /tags 引索", rate=(3, 20), admin_only=True
+)
 async def cmd_tags(message: Message, repo: PostRepo, settings: Settings) -> None:
     kind = "index" if command_arg(message) in ("引索", "index") else "tag"
     cloud = await repo.tag_cloud(kind, limit=40, channel_id=settings.channel_id)

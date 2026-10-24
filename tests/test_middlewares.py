@@ -325,25 +325,35 @@ class TestMetricsIntegration:
         assert any("outcome=user_error" in k for k in keys)
 
 
-class TestOpsCommandPolicy:
-    """运维/探测指令必须只能管理员用 —— 一条断言把策略钉住，加新运维指令忘了标就红。"""
+class TestCommandPolicy:
+    """权限策略钉在测试里：哪边加了指令忘了标（或标错边）就红。
 
-    async def test_all_ops_commands_are_admin_only(self) -> None:
+    成员的入口只有检索：私聊直接发字、/s、/c、/help。
+    资料类（/check /tags）和运维类（/ping /trace /health /metrics /syncstat）
+    都是管理员专用 —— 频道主 2026-10-24 的决定。
+    """
+
+    async def test_admin_only_commands(self) -> None:
+        from animebot.features.search import handlers as search
         from animebot.features.system import handlers as system
 
-        for name in ("ping", "trace", "health", "metrics", "syncstat"):
-            spec = spec_of(getattr(system, f"cmd_{name}"))
-            assert spec is not None, f"cmd_{name} 不见了"
-            assert spec.admin_only, f"/{name} 必须 admin_only=True"
+        admin_cmds = [getattr(system, f"cmd_{n}")
+                      for n in ("ping", "trace", "health", "metrics", "syncstat")]
+        admin_cmds += [search.cmd_check, search.cmd_tags]
+        for fn in admin_cmds:
+            spec = spec_of(fn)
+            assert spec is not None
+            assert spec.admin_only, f"/{spec.name} 必须只能管理员用"
 
-    async def test_search_commands_stay_open(
+    async def test_member_search_commands_stay_open(
         self, settings, rec: Recorder, fake_bot: Bot
     ) -> None:
-        """核心检索功能对所有人开放 —— 收紧权限时别把它们一起锁死。"""
+        """检索入口对所有人开放 —— 收紧权限时别把它们一起锁死。"""
         from animebot.features.manga import handlers as manga
         from animebot.features.search import handlers as search
 
-        for fn in (search.cmd_search, search.cmd_check, search.cmd_tags, manga.cmd_manga):
+        # 纯文本搜索没有 @command 元数据（单独注册），天然无权限门，不在断言之列
+        for fn in (search.cmd_search, manga.cmd_manga):
             spec = spec_of(fn)
             assert spec is not None
             assert not spec.admin_only, f"/{spec.name} 是给频道成员用的，不该 admin_only"

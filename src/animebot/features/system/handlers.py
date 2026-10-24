@@ -64,14 +64,16 @@ async def cmd_help(message: Message, registry: CommandRegistry) -> None:
     await message.reply("\n".join(blocks))
 
 
-@command("ping", desc="测活", rate=(5, 10))
+# 运维/探测指令只对管理员开放：它们回答的是「部署健不健康」，不是用户功能。
+# 普通用户知道 bot 活没活的方式就是直接搜一下 —— 搜索本身有限流，不怕刷。
+@command("ping", desc="测活", rate=(5, 10), admin_only=True)
 async def cmd_ping(message: Message, trace: RequestContext) -> None:
     await message.reply(
         f"pong <code>{trace.elapsed_ms:.0f}ms</code>\ntrace: <code>{trace.trace_id}</code>"
     )
 
 
-@command("trace", desc="显示本次请求的追踪信息", hidden=True)
+@command("trace", desc="显示本次请求的追踪信息", hidden=True, admin_only=True)
 async def cmd_trace(message: Message, trace: RequestContext) -> None:
     fields = "\n".join(f"{k}: <code>{html.escape(str(v))}</code>"
                        for k, v in trace.as_log_fields().items())

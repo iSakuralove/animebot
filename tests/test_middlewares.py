@@ -323,3 +323,27 @@ class TestMetricsIntegration:
 
         keys = METRICS.snapshot()["counters"]
         assert any("outcome=user_error" in k for k in keys)
+
+
+class TestOpsCommandPolicy:
+    """运维/探测指令必须只能管理员用 —— 一条断言把策略钉住，加新运维指令忘了标就红。"""
+
+    async def test_all_ops_commands_are_admin_only(self) -> None:
+        from animebot.features.system import handlers as system
+
+        for name in ("ping", "trace", "health", "metrics", "syncstat"):
+            spec = spec_of(getattr(system, f"cmd_{name}"))
+            assert spec is not None, f"cmd_{name} 不见了"
+            assert spec.admin_only, f"/{name} 必须 admin_only=True"
+
+    async def test_search_commands_stay_open(
+        self, settings, rec: Recorder, fake_bot: Bot
+    ) -> None:
+        """核心检索功能对所有人开放 —— 收紧权限时别把它们一起锁死。"""
+        from animebot.features.manga import handlers as manga
+        from animebot.features.search import handlers as search
+
+        for fn in (search.cmd_search, search.cmd_check, search.cmd_tags, manga.cmd_manga):
+            spec = spec_of(fn)
+            assert spec is not None
+            assert not spec.admin_only, f"/{spec.name} 是给频道成员用的，不该 admin_only"

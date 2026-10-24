@@ -148,10 +148,13 @@ Telegram 客户端搜索或者翻那份 Google 表格。两个都不好用：客
 
 ## 用户与权限
 
-只有两种角色，不做更细的：
+只有两种角色，不做更细的（「指定用户可用的指令」= 把 user_id 加进管理员列表）：
 
-- **普通用户** —— `/search` `/check` `/tags` `/c` `/help` `/ping`
-- **管理员**（`ANIMEBOT_ADMIN_IDS`）—— 额外有 `/health` `/metrics` `/syncstat`
+- **普通用户** —— `/search` `/check` `/tags` `/c` `/help`（各自有限流；运维指令对他们返回「没有权限」）
+- **管理员**（`ANIMEBOT_ADMIN_IDS`，CSV）—— 额外有 `/ping` `/trace` `/health` `/metrics` `/syncstat`
+
+权限、限流、群聊限制都由中间件统一执行（[ADR-0001](ADR/0001-metadata-only-decorator.md)），
+`@command` 声明即生效；写新指令的人不可能漏一层保护。
 
 ## 非功能要求
 

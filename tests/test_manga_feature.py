@@ -99,6 +99,7 @@ def dp(settings: Settings, repo: PostRepo, store: QueryStore) -> Dispatcher:
 
     search_router = Router(name="search")
     search_handlers.register_callbacks(search_router)
+    bind_commands(search_router, collect_specs(search_handlers), reg, "search")
     manga_router = Router(name="manga")
     bind_commands(manga_router, collect_specs(manga_handlers), reg, "manga")
     manga_handlers.register_callbacks(manga_router)
@@ -158,7 +159,9 @@ async def test_c_finds_manga_with_files(
     assert "諫山創 · 34卷 · 2009" in text
     assert "Bangumi" in text
     assert "动漫版" not in text, "漫画搜索里混进了动漫帖"
-    assert markup is None, "一页装得下就不该有翻页行"
+    # 单页没有翻页行，但「🎬 动漫」切换行要在（search 模块在 features 里）
+    assert markup is not None
+    assert [[b.text for b in row] for row in markup.inline_keyboard] == [["🎬 动漫"]]
 
 
 async def test_c_aliases_route_to_same_handler(
@@ -284,7 +287,119 @@ def test_legacy_anime_format_unchanged() -> None:
     assert (ref.page, ref.query, ref.strict) == (3, "青春", False)
 
 
-# ---------------------------------------------------------------- 展示层
+# ---------------------------------------------------------------- 频道切换
+
+
+async def test_anime_result_has_manga_switch_row(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent, store: QueryStore
+) -> None:
+    """动漫结果页：切换行在翻页行上面，callback 是漫画前缀的第 0 页。"""
+    await library.upsert_many([make_post(300 + i, f"进击番外{i:02d}") for i in range(10)])
+    await dp.feed_update(fake_bot, msg_update("/s 进击番外"))
+    _, markup = sent.replies[0]
+    assert markup is not None
+    rows = [[(b.text, b.callback_data) for b in row] for row in markup.inline_keyboard]
+    assert rows[0] == [("📚 漫画", "c:0:l:进击番外")]
+    assert "▶" in [t for t, _ in rows[-1]], "翻页行仍然是最后一行"
+
+
+async def test_single_hit_switch_is_the_only_row(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent
+) -> None:
+    """单条命中（用户截图的场景）：没有翻页行，但切换行在。"""
+    await dp.feed_update(fake_bot, msg_update("/s 动漫版"))
+    _, markup = sent.replies[0]
+    assert markup is not None
+    assert [[b.text for b in row] for row in markup.inline_keyboard] == [["📚 漫画"]]
+
+
+async def test_switch_to_manga_edits_same_message(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent
+) -> None:
+    """点「📚 漫画」= 漫画模块的第 0 页翻页：同一条消息被编辑成漫画结果。"""
+    await dp.feed_update(fake_bot, msg_update("/s 进击"))
+    await dp.feed_update(fake_bot, cb_update("c:0:l:进击", 2))
+    assert len(sent.edits) == 1
+    text, markup = sent.edits[0]
+    assert text.startswith("📚"), "编辑后是漫画结果"
+    assert "t.me/c/1659887654/99" in text
+    assert "动漫版" not in text
+    first_row = next(r for r in markup.inline_keyboard)
+    assert [b.text for b in first_row] == ["🎬 动漫"]
+    assert sent.answers == [""], "回调没 answer，客户端会一直转圈"
+
+
+async def test_switch_on_empty_result_roundtrip(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent
+) -> None:
+    """动漫没有 → 空结果也带切换按钮 → 漫画也没有 → 漫画空结果还能切回来。"""
+    await dp.feed_update(fake_bot, msg_update("/s 排球"))
+    _, markup = sent.replies[0]
+    assert markup is not None, "空结果也要有「去漫画找」的按钮"
+    data = markup.inline_keyboard[0][0].callback_data
+    assert data == "c:0:l:排球"
+
+    await dp.feed_update(fake_bot, cb_update(data, 2))
+    text, markup = sent.edits[0]
+    assert "没找到" in text
+    back = markup.inline_keyboard[0][0]
+    assert (back.text, back.callback_data) == ("🎬 动漫", "s:0:l:排球")
+
+    await dp.feed_update(fake_bot, cb_update("s:0:l:排球", 3))
+    assert len(sent.edits) == 2
+    assert "没找到" in sent.edits[1][0]
+
+
+async def test_switch_preserves_long_query_via_token(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent, store: QueryStore
+) -> None:
+    """超长查询词的切换走 token 路径，往返不丢词。"""
+    long_q = "英雄王，为了穷尽武道而转生～而后，成为世界最强的见习骑士♀～ 测试漫画"
+    data = MANGA_PAGES.encode(0, long_q, store, strict=False)
+    assert data.startswith("ct:")
+    await dp.feed_update(fake_bot, cb_update(data))
+    text, _ = sent.edits[0]
+    assert long_q in text, "token 解出来的查询词必须原样"
+
+
+async def test_manga_result_switches_back_to_anime(
+    dp: Dispatcher, fake_bot: Bot, library: PostRepo, sent: Sent
+) -> None:
+    """/c 的结果点「🎬 动漫」编辑回动漫结果 —— 切过去得能回来。"""
+    await dp.feed_update(fake_bot, msg_update("/c 进击"))
+    await dp.feed_update(fake_bot, cb_update("s:0:l:进击", 2))
+    text, markup = sent.edits[0]
+    assert "动漫版" in text
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "📚 漫画"
+
+
+async def test_no_switch_button_when_other_feature_disabled(
+    settings: Settings, repo: PostRepo, sent: Sent, fake_bot: Bot
+) -> None:
+    """manga 模块没加载时，动漫结果不出现「📚 漫画」—— 点了没人接，客户端转圈。"""
+    from aiogram import Dispatcher, Router
+
+    cfg = settings.model_copy(update={"features": ("system", "search")})
+    d = Dispatcher()
+    d["settings"] = cfg
+    d["repo"] = repo
+    d["search"] = SearchService(repo, cfg)
+    d["query_store"] = QueryStore()
+    reg = CommandRegistry()
+    d["registry"] = reg
+
+    search_router = Router(name="search")
+    search_handlers.register_callbacks(search_router)
+    bind_commands(search_router, collect_specs(search_handlers), reg, "search")
+    d.include_router(search_router)
+
+    await repo.upsert_many([make_post(1, "进击的巨人 动漫版")])
+    await d.feed_update(fake_bot, msg_update("/s 进击"))
+    assert sent.replies[0][1] is None, "单页结果且不能切换时，键盘应该是 None"
+
+
+
 
 
 @pytest.mark.parametrize(

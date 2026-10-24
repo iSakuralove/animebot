@@ -20,7 +20,7 @@ from ...core.registry import command
 from ...observability.context import bind
 from ...observability.metrics import METRICS
 from ...search.callbacks import MANGA_PAGES, QueryStore
-from ...search.presenter import page_keyboard
+from ...search.presenter import anime_switch_button, page_keyboard
 from ...search.service import SearchPage, SearchService
 from ...storage.repo import PostRepo
 from .presenter import landing_keyboard, render_landing, render_page
@@ -98,11 +98,19 @@ async def _present(
     settings: Settings,
     store: QueryStore,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """一页结果 -> (正文, 键盘)。指令和翻页共用，排版只有一份。"""
+    """一页结果 -> (正文, 键盘)。指令和翻页共用，排版只有一份。
+
+    「🎬 动漫」切换按钮只在 search 模块加载了才给 —— 它的 callback 要由 search
+    模块的 on_page 接住，对方不在时点了会一直转圈。
+    """
     channel = manga_search.channel
     files = await repo.file_stats(channel.channel_id, [h.post.message_id for h in page.hits])
     text = render_page(page, files, channel.link_username(settings.link_mode))
-    return text, page_keyboard(page, store, MANGA_PAGES)
+    switch = (
+        anime_switch_button(page, store)
+        if "search" in settings.features else None
+    )
+    return text, page_keyboard(page, store, MANGA_PAGES, switch=switch)
 
 
 async def on_page(

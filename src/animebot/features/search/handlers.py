@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from ..._util import command_arg
 from ...bot.ui import safe_edit
@@ -19,11 +19,12 @@ from ...search.callbacks import ANIME_PAGES, QueryStore
 from ...search.presenter import (
     detail_keyboard,
     detail_preview,
+    manga_switch_button,
     page_keyboard,
     render_detail,
     render_page,
 )
-from ...search.service import SearchService
+from ...search.service import SearchPage, SearchService
 from ...storage.repo import PostRepo
 
 log = get_logger("animebot.search")
@@ -31,6 +32,17 @@ log = get_logger("animebot.search")
 # 列表消息禁用链接预览：正文里有多条网盘直链，不禁的话 Telegram 会抓第一条
 # （通常是百度）弹一个大预览卡，把列表挤下去。详情反过来 —— 特意开预览显示头图。
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+def _keyboard(
+    page: SearchPage, query_store: QueryStore, settings: Settings
+) -> InlineKeyboardMarkup | None:
+    """结果键盘：manga 模块加载了才有「📚 漫画」切换按钮，否则点了没人接。"""
+    switch = (
+        manga_switch_button(page, query_store)
+        if "manga" in settings.features else None
+    )
+    return page_keyboard(page, query_store, ANIME_PAGES, switch=switch)
 
 
 @command(
@@ -100,7 +112,7 @@ async def _reply_search(
 
     await message.reply(
         render_page(page, settings),
-        reply_markup=page_keyboard(page, query_store),
+        reply_markup=_keyboard(page, query_store, settings),
         link_preview_options=_NO_PREVIEW,
     )
 
@@ -176,7 +188,7 @@ async def on_page(
     await safe_edit(
         callback,
         render_page(page, settings),
-        reply_markup=page_keyboard(page, query_store),
+        reply_markup=_keyboard(page, query_store, settings),
         link_preview_options=_NO_PREVIEW,
     )
 

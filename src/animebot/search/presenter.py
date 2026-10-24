@@ -30,7 +30,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ..config import Settings
 from ..domain.post import Post
-from .callbacks import ANIME_PAGES, PageCodec, QueryStore
+from .callbacks import ANIME_PAGES, MANGA_PAGES, PageCodec, QueryStore
 from .highlight import highlight, query_terms
 from .service import SearchHit, SearchPage
 
@@ -98,20 +98,49 @@ def render_page(page: SearchPage, settings: Settings) -> str:
     return f"{head}\n\n{body}"
 
 
-def page_keyboard(
-    page: SearchPage, store: QueryStore, codec: PageCodec = ANIME_PAGES
-) -> InlineKeyboardMarkup | None:
-    """只有翻页行。
+def manga_switch_button(page: SearchPage, store: QueryStore) -> InlineKeyboardButton:
+    """动漫结果页上的「📚 漫画」：同一查询词切到漫画频道第 0 页。
 
-    不再有序号按钮 —— 每条结果的标题本身就是跳原帖的超链接，序号按钮再开一个
-    "无图详情" 是同一件事的第二条路，纯属重复。单页结果没有翻页行，返回 None。
-    `codec` 决定按钮回到哪个模块（动漫 s:/t:，漫画 c:/ct:）。
+    切换就是一个跨频道的翻页按钮 —— 用对方的编解码器、对方的宽松模式编码，
+    点击后由对方模块已有的 on_page 接住。没有新的 callback 格式。
     """
-    if page.is_empty or page.pages <= 1:
+    return InlineKeyboardButton(
+        text="📚 漫画",
+        callback_data=MANGA_PAGES.encode(0, page.query, store, strict=False),
+    )
+
+
+def anime_switch_button(page: SearchPage, store: QueryStore) -> InlineKeyboardButton:
+    """漫画结果页上的「🎬 动漫」：切回动漫频道。方向反过来，其余同上。"""
+    return InlineKeyboardButton(
+        text="🎬 动漫",
+        callback_data=ANIME_PAGES.encode(0, page.query, store, strict=False),
+    )
+
+
+def page_keyboard(
+    page: SearchPage,
+    store: QueryStore,
+    codec: PageCodec = ANIME_PAGES,
+    *,
+    switch: InlineKeyboardButton | None = None,
+) -> InlineKeyboardMarkup | None:
+    """切换行（有则置顶）+ 翻页行（多页才有）。
+
+    `switch` 是频道切换按钮，由调用方在对方模块已加载时才传入 —— 点了没人接的
+    callback，客户端会一直转圈。空结果和单页结果没有翻页行，但有 `switch` 时
+    仍然出键盘：空结果正是「这个频道没有，去那个频道试试」最有用的时刻。
+    不再有序号按钮 —— 每条结果的标题本身就是跳原帖的超链接。`codec` 决定翻页
+    按钮回到哪个模块（动漫 s:/t:，漫画 c:/ct:）。
+    """
+    if switch is None and (page.is_empty or page.pages <= 1):
         return None
 
     kb = InlineKeyboardBuilder()
-    kb.row(*_nav_row(page, store, codec))
+    if switch is not None:
+        kb.row(switch)
+    if not page.is_empty and page.pages > 1:
+        kb.row(*_nav_row(page, store, codec))
     return kb.as_markup()
 
 

@@ -384,10 +384,14 @@ class TestAdminVisibility:
     async def test_menu_scopes(
         self, settings, fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """默认菜单只含成员指令；每个管理员单独推一份含 admin_only 的菜单。"""
+        """三层菜单：默认 scope（私聊）、所有群聊（ephemeral）、管理员私聊。"""
         import types as t
 
-        from aiogram.types import BotCommandScopeChat, BotCommandScopeDefault
+        from aiogram.types import (
+            BotCommandScopeAllGroupChats,
+            BotCommandScopeChat,
+            BotCommandScopeDefault,
+        )
 
         from animebot.bot.app import sync_bot_commands
 
@@ -417,13 +421,21 @@ class TestAdminVisibility:
         await sync_bot_commands(app)
 
         set_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]
-        assert len(set_calls) == 2, "默认 scope 一份 + 管理员私聊一份"
+        assert len(set_calls) == 3, "默认 scope + 所有群聊 + 管理员私聊"
 
         default = next(c for c in set_calls
                        if isinstance(c.scope, BotCommandScopeDefault))
+        group = next(c for c in set_calls
+                     if isinstance(c.scope, BotCommandScopeAllGroupChats))
         admin = next(c for c in set_calls
                      if isinstance(c.scope, BotCommandScopeChat))
         assert admin.scope.chat_id == ADMIN_ID
         assert [b.command for b in default.commands] == ["open_cmd"]
         assert [b.command for b in admin.commands] == ["open_cmd", "adm_cmd"], \
             "管理员多看到 admin_only，hidden 的对谁都不进菜单"
+        assert [b.command for b in group.commands] == ["open_cmd"], \
+            "成员指令在群里也要有，但必须是 ephemeral"
+        assert all(b.is_ephemeral for b in group.commands), \
+            "群菜单里的指令要标 ephemeral：用户发的那条消息对其他人不可见"
+        assert all(b.is_ephemeral is not True for b in default.commands), \
+            "私聊菜单不该标 ephemeral"

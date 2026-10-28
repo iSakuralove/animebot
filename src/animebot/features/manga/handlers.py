@@ -14,7 +14,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from ..._util import command_arg
-from ...bot.ui import safe_edit
+from ...bot.ui import reply, safe_edit
 from ...config import Settings
 from ...core.registry import command
 from ...observability.context import bind
@@ -62,11 +62,14 @@ async def cmd_manga(
     page = await manga_search.search_page(query, strict=False)
     _record(page)
     text, markup = await _present(page, manga_search, repo, settings, query_store)
-    await message.reply(text, reply_markup=markup, link_preview_options=_NO_PREVIEW)
+    await reply(message, text, reply_markup=markup, link_preview_options=_NO_PREVIEW)
 
 
 async def _reply_landing(
-    message: Message, manga_search: SearchService, repo: PostRepo, store: QueryStore
+    message: Message,
+    manga_search: SearchService,
+    repo: PostRepo,
+    store: QueryStore,
 ) -> None:
     cid = manga_search.channel.channel_id
     total = await repo.count(channel_id=cid)
@@ -74,7 +77,8 @@ async def _reply_landing(
     cloud = await repo.tag_cloud("tag", limit=40, channel_id=cid)
     METRICS.incr("manga.landing")
     bind(landing=True, result_count=total)
-    await message.reply(
+    await reply(
+        message,
         render_landing(total, files),
         reply_markup=landing_keyboard(cloud, total, store),
     )

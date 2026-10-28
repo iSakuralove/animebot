@@ -14,6 +14,8 @@ from aiogram.types import Message
 
 from ... import __version__
 from ..._util import command_arg, human_duration
+from ...bot.help import render_command_list
+from ...bot.ui import reply
 from ...config import Settings
 from ...core.errors import NotFound
 from ...core.registry import CommandRegistry, command
@@ -36,7 +38,10 @@ async def cmd_help(
     message: Message, registry: CommandRegistry, is_admin: bool = False
 ) -> None:
     """is_admin 由 AccessMiddleware 从 admin_ids 算好注入 —— 管理员额外看到
-    🔒 标记的专用指令，普通用户的列表里它们不存在。"""
+    🔒 标记的专用指令，普通用户的列表里它们不存在。
+
+    群里回给别人看没用，走 bot.ui.reply（有 ephemeral 条件就私密）。
+    """
     arg = command_arg(message)
 
     if arg:
@@ -55,32 +60,21 @@ async def cmd_help(
             lines.append(html.escape(spec.long_help))
         if spec.rate:
             lines.append(f"\n限流: {spec.rate.per_seconds:.0f} 秒内 {spec.rate.times} 次")
-        await message.reply("\n".join(lines))
+        await reply(message, "\n".join(lines))
         return
 
-    blocks: list[str] = ["<b>可用指令</b>"]
-    for feature, specs in registry.by_feature().items():
-        # hidden 对谁都不列；admin_only 只对管理员列，带 🔒 前缀
-        shown = [
-            s for s in specs
-            if not s.hidden and (is_admin or not s.admin_only)
-        ]
-        if not shown:
-            continue
-        blocks.append(f"\n<i>{html.escape(feature)}</i>")
-        blocks.extend(
-            ("🔒 " if s.admin_only else "") + f"/{s.name} — {html.escape(s.desc or '')}"
-            for s in shown
-        )
-    blocks.append("\n<code>/help &lt;指令&gt;</code> 看详细用法")
-    await message.reply("\n".join(blocks))
+    body = (
+        render_command_list(registry, is_admin=is_admin)
+        + "\n\n<code>/help &lt;指令&gt;</code> 看详细用法"
+    )
+    await reply(message, body)
 
 
 # 运维/探测指令只对管理员开放：它们回答的是「部署健不健康」，不是用户功能。
 # 普通用户知道 bot 活没活的方式就是直接搜一下 —— 搜索本身有限流，不怕刷。
 @command("ping", desc="测活", rate=(5, 10), admin_only=True)
 async def cmd_ping(message: Message, trace: RequestContext) -> None:
-    await message.reply(
+    await reply(message, 
         f"pong <code>{trace.elapsed_ms:.0f}ms</code>\ntrace: <code>{trace.trace_id}</code>"
     )
 
@@ -89,7 +83,7 @@ async def cmd_ping(message: Message, trace: RequestContext) -> None:
 async def cmd_trace(message: Message, trace: RequestContext) -> None:
     fields = "\n".join(f"{k}: <code>{html.escape(str(v))}</code>"
                        for k, v in trace.as_log_fields().items())
-    await message.reply(f"<b>请求上下文</b>\n{fields}")
+    await reply(message, f"<b>请求上下文</b>\n{fields}")
 
 
 @command("health", desc="健康检查", admin_only=True)
@@ -153,7 +147,7 @@ async def cmd_health(
             if not access.ok:
                 lines.append(html.escape(access.hint))
 
-    await message.reply("\n".join(lines))
+    await reply(message, "\n".join(lines))
 
 
 @command("syncstat", desc="增量同步水位", admin_only=True)
@@ -181,7 +175,7 @@ async def cmd_syncstat(message: Message, sync: ChannelSync, settings: Settings) 
             f"{html.escape(r['last_stored_at'] or '—')}\n"
             f"累计: 收到 {r['seen_count']} 条 / 入库 {r['stored_count']} 条"
         )
-    await message.reply("\n".join(blocks))
+    await reply(message, "\n".join(blocks))
 
 
 @command("metrics", desc="运行指标", admin_only=True)
@@ -207,4 +201,4 @@ async def cmd_metrics(message: Message) -> None:
             )
     else:
         lines.append("（暂无）")
-    await message.reply("\n".join(lines))
+    await reply(message, "\n".join(lines))

@@ -94,7 +94,7 @@ polling 的瞬时网络故障（`Failed to fetch updates - TelegramNetworkError 
 `Bad Gateway`）是 WARNING，紧跟着一条 `Connection established` 就是自己恢复了。
 **ERROR 级别现在只留给真问题**：`handler.crash`（带完整栈）、409 冲突、token 失效。
 
-## 部署前必须做的两件事
+## 部署前必须做的三件事
 
 ### 一、把 bot 加进频道并设为管理员
 
@@ -104,7 +104,18 @@ Bot API 的 `channel_post` **只推给频道的管理员 bot**。没做这一步
 启动自检会警告，`/health` 也会显示频道身份。但没人会主动去看一个看起来正常
 的系统，所以这一步要在部署清单里。
 
-### 二、revoke 旧 token
+### 二、把 bot 加进讨论群并设为管理员（群聊检索要用）
+
+群里三种入口（`@bot 关键词`、回复 bot、`/s@bot`）的**投递**由 Telegram 的
+隐私模式保证，不加管理员也能收到。但**私密回复**只能在两种情况下发：
+收到触发动作后 15 秒内，或者 bot 是群管理员。`@bot 关键词` 属于前者之外的情况，
+所以非管理员的 bot 只能公开回复搜索结果。
+
+不加管理员的表现：功能可用，只是每条结果都公开在群里（日志有
+`reply.ephemeral_failed`）。要私密就必须设为管理员。细节见
+[design/group-search.md](design/group-search.md)。
+
+### 三、revoke 旧 token
 
 开发期间 `.env` 和 `venv/.env` 里各有一个 token，其中一个还在 BotFather 那边
 有效。用 `/revoke` 作废不用的那个。

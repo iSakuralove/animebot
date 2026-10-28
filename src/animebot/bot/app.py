@@ -9,7 +9,12 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+)
 
 from ..config import Settings, get_settings
 from ..core.container import Container
@@ -173,13 +178,21 @@ def _build_dispatcher(
     return dp
 
 
-def _menu_items(registry: CommandRegistry, *, for_admin: bool) -> list[BotCommand]:
+def _menu_items(
+    registry: CommandRegistry, *, for_admin: bool, ephemeral: bool = False
+) -> list[BotCommand]:
     """指令菜单条目。成员看 visible()；管理员额外看非隐藏的 admin_only 指令。
 
     hidden 的（/trace）对谁都不进菜单 —— 输入框自动补全里也不该有调试指令。
+    ephemeral=True 用于群聊 scope：用户从菜单里选指令时，那条消息对群里其他人
+    不可见（Bot API 10.2 的双向隐私），bot 的回复也就有资格走私密通道。
     """
     return [
-        BotCommand(command=s.name, description=s.desc or s.name)
+        BotCommand(
+            command=s.name,
+            description=s.desc or s.name,
+            is_ephemeral=True if ephemeral else None,
+        )
         for s in registry
         if not s.hidden and (for_admin or not s.admin_only)
     ]
@@ -188,16 +201,20 @@ def _menu_items(registry: CommandRegistry, *, for_admin: bool) -> list[BotComman
 async def sync_bot_commands(app: App) -> None:
     """把注册表推到 Telegram 的指令菜单。加指令不需要手动去 BotFather 改。
 
-    两层 scope：默认 scope 是全员可见的成员指令；每个管理员再单独推一份含
-    admin_only 指令的菜单（BotCommandScopeChat 只影响那个私聊）—— 否则管理员
-    也看不见自己的指令，只能手打。管理员还没跟 bot 说过话时 chat 不存在，
-    set 会 400：跳过打个 warning，等下次重启再补。
+    三层 scope：
+      - 默认 scope：私聊里全员可见的成员指令。
+      - 所有群聊：同一批指令，但标成 ephemeral —— 群里搜完不刷屏。
+      - 每个管理员私聊：额外的 admin_only 指令（BotCommandScopeChat 只影响
+        那个私聊），否则管理员也看不见自己的指令，只能手打。管理员还没跟 bot
+        说过话时 chat 不存在，set 会 400：跳过打个 warning，等下次重启再补。
     """
     if app.bot is None:
         return
     member_menu = _menu_items(app.registry, for_admin=False)
     await app.bot.set_my_commands(member_menu, scope=BotCommandScopeDefault())
-    pushed = 1
+    group_menu = _menu_items(app.registry, for_admin=False, ephemeral=True)
+    await app.bot.set_my_commands(group_menu, scope=BotCommandScopeAllGroupChats())
+    pushed = 2
     if app.settings.admin_ids:
         admin_menu = _menu_items(app.registry, for_admin=True)
         for admin_id in app.settings.admin_ids:

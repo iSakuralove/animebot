@@ -23,6 +23,7 @@ from ..ingest.sync import ChannelSync
 from ..observability.context import RequestContext, reset_context, set_context
 from ..observability.logging import get_logger
 from ..observability.metrics import METRICS
+from .ui import reply as ui_reply
 
 log = get_logger("animebot.mw")
 
@@ -177,6 +178,8 @@ async def _reply(event: TelegramObject, text: str) -> None:
        异常就会让 bot 在 3000 人的频道里公开发「内部错误，编号 xxx」。
     2. 回复本身失败也不能再抛 —— 那会变成 aiogram 的未处理异常，栈追踪里
        看不到原始错误。
+
+    群聊里走 `ui.reply`：能私密就私密（用法提示、限流提示对别人是噪音）。
     """
     inner = event.event if isinstance(event, Update) else event
     try:
@@ -184,7 +187,7 @@ async def _reply(event: TelegramObject, text: str) -> None:
             if inner.chat.type == ChatType.CHANNEL:
                 log.warning("reply.suppressed_in_channel", text_head=text[:60])
                 return
-            await inner.reply(text)
+            await ui_reply(inner, text)
         elif isinstance(inner, CallbackQuery):
             await inner.answer(text[:200], show_alert=True)
     except Exception:

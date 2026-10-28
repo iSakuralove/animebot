@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import html
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.filters import Filter
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from ..._util import command_arg
-from ...bot.ui import safe_edit
+from ...bot.help import render_command_list
+from ...bot.ui import reply, safe_edit
 from ...config import Settings
 from ...core.errors import NotFound, UsageError
-from ...core.registry import command
+from ...core.registry import CommandRegistry, command
 from ...observability.context import bind
 from ...observability.logging import get_logger
 from ...observability.metrics import METRICS
@@ -32,6 +34,45 @@ log = get_logger("animebot.search")
 # 列表消息禁用链接预览：正文里有多条网盘直链，不禁的话 Telegram 会抓第一条
 # （通常是百度）弹一个大预览卡，把列表挤下去。详情反过来 —— 特意开预览显示头图。
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+class _MentionsMe(Filter):
+    """群消息的第一个词是 @本 bot。
+
+    Telegram 文档里「有保证投递」的只有三类：`/cmd@bot`、对 bot 消息的回复、
+    以及菜单里选出的 ephemeral 指令。@提及不在那张清单上 —— 实测里 bot 是群
+    管理员时能收到（管理员本来就收全部消息），不是管理员时不保证。
+
+    所以这条入口是**锦上添花**：主路径是 `/s@bot` 和「回复 bot」，它们有文档
+    保证。`bot.me()` 由 aiogram 缓存，热路径没有网络往返。
+    """
+
+    async def __call__(self, message: Message, bot: Bot) -> bool:
+        text = (message.text or "").lstrip()
+        if not text.startswith("@"):
+            return False
+        me = await bot.me()
+        username = me.username
+        if not username:
+            return False
+        head = text.split(maxsplit=1)[0]
+        return head[1:].casefold() == username.casefold()
+
+
+class _RepliesToMe(Filter):
+    """群消息是对 bot 自己某条消息的回复。
+
+    同样属于「明确针对 bot」的一类，隐私模式下也能收到。给了用户一条不打扰
+    别人的路径：@bot 看到能干什么之后，直接回复那条消息打关键词就行。
+    """
+
+    async def __call__(self, message: Message, bot: Bot) -> bool:
+        replied = message.reply_to_message
+        return bool(
+            replied
+            and replied.from_user
+            and replied.from_user.id == bot.id
+        )
 
 
 def _keyboard(
@@ -91,6 +132,62 @@ async def on_plain_text(
     await _reply_search(message, query, search, settings, query_store, strict=False)
 
 
+async def on_mention(
+    message: Message,
+    bot: Bot,
+    search: SearchService,
+    settings: Settings,
+    query_store: QueryStore,
+    registry: CommandRegistry,
+    is_admin: bool = False,
+) -> None:
+    """群里的 `@bot 关键词` = 宽松搜索，和私聊纯文本同一条路。
+
+    不带关键词时就是「这个 bot 能干什么」：列出指令，并给出群里最省事的用法 ——
+    正好接住「@bot 后看得到指令，再输入关键词」这个交互。
+
+    投递不保证（见 `_MentionsMe`），所以提示里给的第一选择是菜单里的 `/s`：
+    菜单项标了 ephemeral，选出来既有保证投递、又不会打扰别人。
+    """
+    text = message.text or ""
+    parts = text.strip().split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    bind(feature="search", command="mention", scope="anime", mode="lenient")
+    if not query:
+        me = await bot.me()
+        name = f"@{me.username}" if me.username else "我"
+        hint = (
+            f"\n\n群里搜索：点输入框左边的 <b>/</b> 选 <code>/s</code>"
+            f"（最稳，不会打扰别人）；也可以直接发 <code>{html.escape(name)} 关键词</code>"
+            "，或者回复这条消息打关键词。"
+        )
+        bind(landing=True)
+        await reply(
+            message,
+            render_command_list(registry, is_admin=is_admin) + hint,
+        )
+        return
+    await _reply_search(message, query, search, settings, query_store, strict=False)
+
+
+async def on_reply_to_me(
+    message: Message,
+    search: SearchService,
+    settings: Settings,
+    query_store: QueryStore,
+) -> None:
+    """群里回复 bot 的消息 = 搜索。
+
+    和 @bot 关键词 等价，只是触发方式不同：`@bot` 看指令，然后直接回复那条
+    消息打关键词。回复同样属于「明确针对 bot」，隐私模式不影响投递。
+    """
+    query = (message.text or "").strip()
+    if not query or query.startswith("/"):   # 指令由 Command 过滤器接
+        return
+    bind(feature="search", command="reply", scope="anime", mode="lenient")
+    await _reply_search(message, query, search, settings, query_store, strict=False)
+
+
 async def _reply_search(
     message: Message,
     query: str,
@@ -100,7 +197,7 @@ async def _reply_search(
     *,
     strict: bool,
 ) -> None:
-    """两个入口的共同主体。差别只在查询词来源和 strict，逻辑一份。"""
+    """三个入口的共同主体。差别只在查询词来源和 strict，逻辑一份。"""
     bind(scope="anime", query=query[:80], mode="strict" if strict else "lenient")
     page = await search.search_page(query, strict=strict)
     METRICS.incr("search.query", found=not page.is_empty)
@@ -110,7 +207,8 @@ async def _reply_search(
         reason=page.hits[0].reason if page.hits else "none",
     )
 
-    await message.reply(
+    await reply(
+        message,
         render_page(page, settings),
         reply_markup=_keyboard(page, query_store, settings),
         link_preview_options=_NO_PREVIEW,
@@ -139,10 +237,11 @@ async def cmd_check(
     METRICS.incr("check.query", found=hit is not None)
     bind(result_count=int(hit is not None))
     if hit is None:
-        await message.reply(f"❌ <b>{html.escape(query)}</b> 没有发过")
+        await reply(message, f"❌ <b>{html.escape(query)}</b> 没有发过")
         return
     p = hit.post
-    await message.reply(
+    await reply(
+        message,
         render_detail(p),
         reply_markup=detail_keyboard(p, settings),
         link_preview_options=detail_preview(p, settings),
@@ -159,7 +258,7 @@ async def cmd_tags(message: Message, repo: PostRepo, settings: Settings) -> None
         raise NotFound("标签")
     title = "引索" if kind == "index" else "标签"
     body = "  ".join(f"#{html.escape(t)}<code>({n})</code>" for t, n in cloud)
-    await message.reply(f"<b>{title}</b>（共 {len(cloud)} 个）\n\n{body}")
+    await reply(message, f"<b>{title}</b>（共 {len(cloud)} 个）\n\n{body}")
 
 
 async def on_page(
@@ -225,4 +324,29 @@ def register_plain_search(router: Router) -> None:
         on_plain_text,
         F.chat.type == "private",
         F.text & ~F.text.startswith("/"),
+    )
+
+
+def register_mention_search(router: Router) -> None:
+    """群里两条「明确针对 bot」的入口，都没有 @command 元数据。
+
+    - `@bot 关键词` —— 直接搜；不带关键词就列指令。
+    - 回复 bot 的任意消息 —— 当作关键词搜。
+
+    只在群/超级群注册。群里不注册「所有纯文本」，否则每句闲聊都会被当搜索。
+    两条入口都靠 Telegram 的隐私模式规则保证能收到：@提及和回复都属于
+    「明确针对 bot」的消息，不需要关隐私、也不要求 bot 是管理员。
+    """
+    group = {"group", "supergroup"}
+    router.message.register(
+        on_mention,
+        F.chat.type.in_(group),
+        F.text,
+        _MentionsMe(),
+    )
+    router.message.register(
+        on_reply_to_me,
+        F.chat.type.in_(group),
+        F.text & ~F.text.startswith("/"),
+        _RepliesToMe(),
     )

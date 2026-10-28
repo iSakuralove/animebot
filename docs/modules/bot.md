@@ -9,7 +9,8 @@
 | [wiring.py](../../src/animebot/bot/wiring.py) | `@command` → aiogram Router |
 | [middlewares.py](../../src/animebot/bot/middlewares.py) | trace / 埋点 / 错误边界 / 限流 / 权限 / 频道同步 |
 | [preflight.py](../../src/animebot/bot/preflight.py) | 启动自检：bot 在每个被索引的频道里是管理员吗 |
-| [ui.py](../../src/animebot/bot/ui.py) | `safe_edit`：翻页就地编辑。动漫、漫画两个模块共用，所以不放在任何一个 feature 里 |
+| [ui.py](../../src/animebot/bot/ui.py) | `reply` / `safe_edit`：群聊走私密回复、翻页就地编辑。动漫、漫画两个模块共用 |
+| [help.py](../../src/animebot/bot/help.py) | 指令清单渲染，`/help` 和群里的 `@bot` 共用一份 |
 
 ## 中间件顺序是设计，不是偏好
 
@@ -136,5 +137,19 @@ if not with_bot:
 
 `sync_bot_commands()` 从 `registry.visible()` 生成 `setMyCommands`。
 加一个 `@command` 就自动进 Telegram 的指令菜单，不需要去 BotFather 手动改。
+
+推三份 scope：默认（私聊）、所有群聊（同一批指令但标 `is_ephemeral=True`）、
+每个管理员私聊（多一份 `admin_only`）。群聊那份是「双向隐私」的另一半 ——
+用户从菜单选指令时，那条消息对群里其他人不可见，见
+[design/group-search.md](../design/group-search.md)。
+
+## 群聊里的回复走 ui.reply
+
+`ui.reply()` 是唯一的出口：私聊原样 `reply`；群里优先发 ephemeral（只有发起人
+看得到），失败退回公开回复。**能不能私密取决于 bot 是不是群管理员** —— 平台
+限制，不是代码能绕过的。`safe_edit()` 按消息类型分流：普通消息 `editMessageText`，
+ephemeral 消息 `editEphemeralMessageText`（后者的 message_id 恒为 0）。
+
+handler 里不要直接调 `message.reply`，否则群聊里会把搜索结果公开出去。
 
 怎么加模块见 [adding_a_feature.md](../adding_a_feature.md)。

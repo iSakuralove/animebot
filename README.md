@@ -48,6 +48,8 @@ uv run animebot run
 | 私聊直接发字 | 搜动漫。标题命中优先，打错字会纠错 |
 | `/s <关键词>` | 搜动漫，严谨模式：标题精确匹配，不猜错字 |
 | `/c <关键词>` | **搜漫画频道**。中文名 / 别名 / 日文原名、`#标签`、打错字给「名字相近」；不带词给热门标签按钮 |
+| `@bot <关键词>` | 群里搜动漫（等同私聊纯文本）。不带关键词列出可用指令 |
+| 回复 bot 的消息 <关键词> | 群里搜动漫；接「@bot 看用法 → 直接回关键词」这条路径 |
 | `/check <番名>` | 只回答发过 / 没发过（管理员） |
 | `/tags` | 标签列表；`/tags 引索` 看拼音首字母索引（管理员） |
 | `/help [指令]` | 从注册表自动生成 |
@@ -176,7 +178,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-395 个测试。三个是回归红线：
+422 个测试。四个是回归红线：
 
 - [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实动漫帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。
@@ -185,6 +187,9 @@ uv run ruff check src tests
 - [test_sync.py](tests/test_sync.py) 的 `test_roundtrip_matches_export`（漫画在
   `test_manga_parse.py`）—— 真实消息反向构造成 aiogram Message，逐字段断言两条入口
   结果相同。
+- [test_group_ephemeral.py](tests/test_group_ephemeral.py) —— 群聊入口。用真的
+  `Message.answer` / bot 对象断言发出去的是 `ephemeral_message_parameters`，
+  而不是被替换成假货的 `reply`（假货掩盖过 `Message.reply` 不接受重复 kwargs 的 bug）。
 
 基线：
 

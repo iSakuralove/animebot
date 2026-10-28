@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from aiogram import Bot, Dispatcher, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import SendMessage
 from aiogram.types import (
     CallbackQuery,
@@ -297,6 +297,31 @@ async def test_ephemeral_unavailable_falls_back_to_public(
     await dp.feed_update(fake_bot, group_update(f"@{BOT_USERNAME} 青春"))
     assert len(sent.replies) == 1
     assert "青春" in sent.replies[0][0]
+
+
+async def test_network_error_does_not_trigger_public_fallback(
+    fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """网络错误不退回公开回复。
+
+    请求可能已经送达 Telegram 只是响应超时 —— 这时再发一条公开的，等于把
+    本该私密的结果贴到群里。网络错误交给 ErrorBoundary 处理。
+    """
+    async def fake_call(self: Bot, method: object, **_kw: object) -> object:
+        raise TelegramNetworkError(method=method, message="Request timeout error")
+
+    monkeypatch.setattr(type(fake_bot), "__call__", fake_call, raising=True)
+
+    msg = Message(
+        message_id=5,
+        date=NOW,
+        chat=Chat(id=GROUP_ID, type="supergroup"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        text="@AnimeCoffeebot 青春",
+    ).as_(fake_bot)
+
+    with pytest.raises(TelegramNetworkError):
+        await ui.reply(msg, "结果")
 
 
 # ---------------------------------------------------------------- 整套装配

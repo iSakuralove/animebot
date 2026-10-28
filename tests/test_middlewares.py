@@ -46,7 +46,11 @@ def make_update(text: str, *, user_id: int = USER_ID, chat_type: str = "private"
 
 
 class Recorder:
-    """假的 Message.reply：把回复内容记下来而不是真发出去。"""
+    """假的 Message.reply / answer：把回复内容记下来而不是真发出去。
+
+    `answer` 也要换 —— 群聊里的回复先走 ephemeral（`Message.answer` + 接收者），
+    只替换 `reply` 的话会真的打 Telegram，测试变成联网测试。
+    """
 
     def __init__(self) -> None:
         self.replies: list[str] = []
@@ -62,7 +66,11 @@ def rec(monkeypatch: pytest.MonkeyPatch) -> Recorder:
     async def fake_reply(self: Message, text: str, **kw: object) -> None:
         await r.reply(text)
 
+    async def fake_answer(self: Message, text: str, **kw: object) -> None:
+        await r.reply(text)
+
     monkeypatch.setattr(Message, "reply", fake_reply, raising=True)
+    monkeypatch.setattr(Message, "answer", fake_answer, raising=True)
     return r
 
 

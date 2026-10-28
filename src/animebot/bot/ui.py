@@ -10,7 +10,7 @@ import asyncio
 from typing import Any
 
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import CallbackQuery, EphemeralMessageParameters, Message
 
 from ..observability.logging import get_logger
@@ -40,8 +40,9 @@ async def reply(message: Message, text: str, **kw: Any) -> None:
     ephemeral = EphemeralMessageParameters(receiver_user_id=message.from_user.id)
     try:
         await message.answer(text, ephemeral_message_parameters=ephemeral, **kw)
-    except TelegramAPIError as exc:
-        # 非管理员 / 老客户端：私密回复不可用，退回公开回复。
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        # 非管理员 / 老客户端 / 没有发 ephemeral 的权限：私密回复不可用，退回公开回复。
+        # 只兜这两类 —— 网络错误时请求可能已经送达，再发一遍会把结果公开出去。
         log.info("reply.ephemeral_failed", chat_id=message.chat.id,
                  error=str(exc)[:120])
         await message.reply(text, **kw)

@@ -17,6 +17,10 @@
 （`BotCommand.is_ephemeral`，菜单用 `BotCommandScopeAllGroupChats` 单独推）。
 所以查询词不会留在群聊记录里。
 
+**但这个标记是逐条可控的**（`@command(group_ephemeral=False)`）。检索类要保持
+私密（查询词是私事），而 `/q` 必须关掉 —— 它的答案已经公开了，问题再藏起来
+就变成「群里只看到 bot 在自说自话」。
+
 搜索结果是 ephemeral 消息：只有发起人看得到，带可点的标题深链和翻页按钮。
 翻页走 `editEphemeralMessageText`，不会给群里发任何东西。
 

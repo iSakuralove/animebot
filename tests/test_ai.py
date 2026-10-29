@@ -1275,3 +1275,20 @@ async def test_group_search_reply_stays_ephemeral(
     await ui.reply(msg, "结果")
     assert [c[0] for c in calls] == ["answer"]
     assert calls[0][1]["ephemeral_message_parameters"].receiver_user_id == USER_ID
+
+
+def test_q_is_not_ephemeral_in_group_menu() -> None:
+    """`/q` 在群菜单里不能标 ephemeral。
+
+    答案已经改成公开了，问题却藏起来的话，群里只看到 bot 在自说自话 ——
+    用户截图里就是这个问题：`/q` 那条「仅你可见」，而回复是公开的。
+    """
+    from animebot.core.registry import spec_of
+
+    spec = spec_of(ai_handlers.cmd_q)
+    assert spec is not None
+    assert spec.group_ephemeral is False, "/q 的问题必须公开"
+    # 检索类相反：查询词是私事
+    from animebot.features.search.handlers import cmd_search
+
+    assert spec_of(cmd_search).group_ephemeral is True

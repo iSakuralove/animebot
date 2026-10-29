@@ -98,6 +98,8 @@ def _stop_keyboard(gid: str) -> InlineKeyboardMarkup:
     usage="/q 进击的巨人在 bangumi 上评分多少？",
     aliases=("ask", "ai"),
     rate=(4, 60),
+    # 群里的答案是公开的，问题也必须公开 —— 否则群里只看到 bot 在自说自话。
+    group_ephemeral=False,
     long_help=(
         "带工具的知识问答。它会自己决定查 Bangumi（搜条目 / 看详情 / 列榜单）、"
         "联网搜索还是翻频道索引，答案边生成边显示出来。\n\n"

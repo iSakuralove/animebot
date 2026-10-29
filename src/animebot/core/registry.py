@@ -49,6 +49,10 @@ class CommandSpec:
     hidden: bool = False             # 不进 /help 和指令菜单
     rate: RateLimit | None = None
     group_allowed: bool = True       # 是否允许在群里用
+    #: 群菜单里把这条指令标成 ephemeral（用户选出来的那条消息别人看不见）。
+    #: 检索类该开（查询词是私事），但答案公开的指令必须关 —— 否则群里只看到
+    #: bot 在自说自话，问题本身是隐形的。
+    group_ephemeral: bool = True
     long_help: str = ""              # /help <cmd> 的详细说明
 
     @property
@@ -78,6 +82,7 @@ def command(
     hidden: bool = False,
     rate: tuple[int, float] | RateLimit | None = None,
     group_allowed: bool = True,
+    group_ephemeral: bool = True,
     long_help: str = "",
 ) -> Callable[[H], H]:
     """声明一个指令。只登记元数据，不包裹行为。"""
@@ -99,6 +104,7 @@ def command(
                 hidden=hidden,
                 rate=RateLimit.of(rate),
                 group_allowed=group_allowed,
+                group_ephemeral=group_ephemeral,
                 long_help=long_help,
             ),
         )

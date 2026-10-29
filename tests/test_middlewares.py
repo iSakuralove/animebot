@@ -406,6 +406,9 @@ class TestAdminVisibility:
         @command("open_cmd", desc="成员用")
         async def open_cmd(message: Message) -> None: ...
 
+        @command("public_cmd", desc="答案公开", group_ephemeral=False)
+        async def public_cmd(message: Message) -> None: ...
+
         @command("adm_cmd", desc="管理员用", admin_only=True)
         async def adm_cmd(message: Message) -> None: ...
 
@@ -414,7 +417,11 @@ class TestAdminVisibility:
 
         reg = CommandRegistry()
         from animebot.bot.wiring import bind_commands
-        bind_commands(Router(), [spec_of(open_cmd), spec_of(adm_cmd), spec_of(dbg)], reg, "t")
+        bind_commands(
+            Router(),
+            [spec_of(open_cmd), spec_of(public_cmd), spec_of(adm_cmd), spec_of(dbg)],
+            reg, "t",
+        )
 
         calls: list[object] = []
 
@@ -438,12 +445,17 @@ class TestAdminVisibility:
         admin = next(c for c in set_calls
                      if isinstance(c.scope, BotCommandScopeChat))
         assert admin.scope.chat_id == ADMIN_ID
-        assert [b.command for b in default.commands] == ["open_cmd"]
-        assert [b.command for b in admin.commands] == ["open_cmd", "adm_cmd"], \
-            "管理员多看到 admin_only，hidden 的对谁都不进菜单"
-        assert [b.command for b in group.commands] == ["open_cmd"], \
-            "成员指令在群里也要有，但必须是 ephemeral"
-        assert all(b.is_ephemeral for b in group.commands), \
-            "群菜单里的指令要标 ephemeral：用户发的那条消息对其他人不可见"
-        assert all(b.is_ephemeral is not True for b in default.commands), \
+        assert [b.command for b in default.commands] == ["open_cmd", "public_cmd"]
+        assert [b.command for b in admin.commands] == [
+            "open_cmd", "public_cmd", "adm_cmd"
+        ], "管理员多看到 admin_only，hidden 的对谁都不进菜单"
+        assert [b.command for b in group.commands] == ["open_cmd", "public_cmd"]
+
+        flags = {b.command: b.is_ephemeral for b in group.commands}
+        assert flags["open_cmd"] is True, "默认标 ephemeral：用户发的消息别人看不见"
+        assert flags["public_cmd"] is None, (
+            "group_ephemeral=False 的不标 —— 答案公开的，问题也得公开"
+        )
+        assert all(b.is_ephemeral is not True for b in default.commands), (
             "私聊菜单不该标 ephemeral"
+        )

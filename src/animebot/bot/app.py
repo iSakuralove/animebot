@@ -184,14 +184,17 @@ def _menu_items(
     """指令菜单条目。成员看 visible()；管理员额外看非隐藏的 admin_only 指令。
 
     hidden 的（/trace）对谁都不进菜单 —— 输入框自动补全里也不该有调试指令。
-    ephemeral=True 用于群聊 scope：用户从菜单里选指令时，那条消息对群里其他人
-    不可见（Bot API 10.2 的双向隐私），bot 的回复也就有资格走私密通道。
+
+    `ephemeral=True` 是群聊 scope：用户在菜单里选出来的那条消息对其他人不可见
+    （Bot API 10.2 的双向隐私）。**逐条可控** —— `CommandSpec.group_ephemeral`
+    关掉就不标。检索类该开（查询词是私事），答案公开的 `/q` 必须关：否则群里
+    看得到答案却看不到问题。
     """
     return [
         BotCommand(
             command=s.name,
             description=s.desc or s.name,
-            is_ephemeral=True if ephemeral else None,
+            is_ephemeral=True if (ephemeral and s.group_ephemeral) else None,
         )
         for s in registry
         if not s.hidden and (for_admin or not s.admin_only)

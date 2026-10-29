@@ -1180,3 +1180,98 @@ async def test_streaming_never_sends_over_limit(
     for text in everything:
         assert len(text) <= 4096, f"超过 Telegram 上限：{len(text)}"
     assert len(sent.sent) >= 3, "9000 字必须切成多条"
+
+
+# ---------------------------------------------------------------- 公开 vs 继承
+
+
+async def test_public_reply_does_not_inherit_ephemeral(
+    monkeypatch: pytest.MonkeyPatch, fake_bot: Bot
+) -> None:
+    """回归（真机上翻过车）：从群的 ephemeral 指令菜单发 `/q`。
+
+    群菜单里的指令标了 `is_ephemeral=True`，用户选出来那条**本身就是
+    ephemeral 消息**。aiogram 的 `Message.reply` 会从入站的
+    `ephemeral_message_id` 自动补 ephemeral 参数，于是明明要公开的回复还是
+    「仅自己可见」。所以公开路径必须走 `answer`。
+    """
+    from animebot.bot import ui
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_reply(self: Message, text: str, **kw: Any) -> Message:
+        calls.append(("reply", kw))
+        return self
+
+    async def fake_answer(self: Message, text: str, **kw: Any) -> Message:
+        calls.append(("answer", kw))
+        return self
+
+    monkeypatch.setattr(Message, "reply", fake_reply, raising=True)
+    monkeypatch.setattr(Message, "answer", fake_answer, raising=True)
+
+    # 入站是 ephemeral 指令（message_id 为 0，带 ephemeral_message_id）
+    msg = Message(
+        message_id=0, date=NOW,
+        chat=Chat(id=-1001234567890, type="supergroup"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        text="/q 黑猫是什么猫", ephemeral_message_id=88,
+    )
+    await ui.reply(msg, "答案", public=True)
+
+    assert [c[0] for c in calls] == ["answer"], "公开必须走 answer，不能走 reply"
+    assert "ephemeral_message_parameters" not in calls[0][1]
+
+
+async def test_private_reply_unaffected(
+    monkeypatch: pytest.MonkeyPatch, fake_bot: Bot
+) -> None:
+    from animebot.bot import ui
+
+    calls: list[str] = []
+
+    async def fake_reply(self: Message, text: str, **kw: Any) -> Message:
+        calls.append("reply")
+        return self
+
+    async def fake_answer(self: Message, text: str, **kw: Any) -> Message:
+        calls.append("answer")
+        return self
+
+    monkeypatch.setattr(Message, "reply", fake_reply, raising=True)
+    monkeypatch.setattr(Message, "answer", fake_answer, raising=True)
+
+    msg = Message(message_id=5, date=NOW, chat=Chat(id=USER_ID, type="private"),
+                  from_user=User(id=USER_ID, is_bot=False, first_name="T"), text="/q x")
+    await ui.reply(msg, "答案", public=True)
+    assert calls == ["reply"], "私聊行为不变"
+
+
+async def test_group_search_reply_stays_ephemeral(
+    monkeypatch: pytest.MonkeyPatch, fake_bot: Bot
+) -> None:
+    """搜索结果仍然私密 —— 公开 /q 不能顺手把搜索也放出来。"""
+    from animebot.bot import ui
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_reply(self: Message, text: str, **kw: Any) -> Message:
+        calls.append(("reply", kw))
+        return self
+
+    async def fake_answer(self: Message, text: str, **kw: Any) -> Message:
+        calls.append(("answer", kw))
+        return self
+
+    monkeypatch.setattr(Message, "reply", fake_reply, raising=True)
+    monkeypatch.setattr(Message, "answer", fake_answer, raising=True)
+
+    msg = Message(
+        message_id=7, date=NOW,
+        chat=Chat(id=-1001234567890, type="supergroup"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        text="@AnimeCoffeebot 黑猫",
+    )
+    await ui.reply(msg, "结果")
+    assert [c[0] for c in calls] == ["answer"]
+    assert calls[0][1]["ephemeral_message_parameters"].receiver_user_id == USER_ID

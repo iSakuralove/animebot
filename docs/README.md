@@ -20,6 +20,7 @@
 | 漫画频道 `/c` 的数据长什么样、交互怎么定的 | [design/manga-search.md](design/manga-search.md) |
 | 群聊里 `@bot` / `/s` 怎么工作、为什么走私密回复 | [design/group-search.md](design/group-search.md) |
 | `/q` AI 对话怎么接的、流式怎么做 | [design/ai-chat.md](design/ai-chat.md) |
+| `/q` 模块的契约、五个工具、11 个坑 | [modules/ai.md](modules/ai.md) |
 | 检索层到 5 万帖时该换成什么（算法调研） | [design/search-optimization.md](design/search-optimization.md) |
 | 部署、监控、看日志 | [operations.md](operations.md) |
 
@@ -43,7 +44,8 @@ docs/
 │   ├── storage.md                SQLite 仓储
 │   ├── search.md                 检索与展示
 │   ├── bot.md                    aiogram 装配层
-│   └── ingest.md                 回填与增量同步
+│   ├── ingest.md                 回填与增量同步
+│   └── ai.md                     /q：协议、工具、流式
 └── design/                       具体功能的设计文档
     ├── incremental-sync.md
     ├── title-first-search.md

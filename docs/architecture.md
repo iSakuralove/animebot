@@ -323,3 +323,32 @@ src/animebot/
 ## 分模块细节
 
 各层的契约、边界、坑，见 [modules/](modules/)。
+
+## `/q`：AI 对话（第三个业务模块）
+
+`features/ai/` 是继 `search`、`manga` 之后第三个业务模块，验证了「加模块不用
+改 app.py」这条设计。它和搜索走**完全不同的链路**：
+
+```
+/q 问题
+  ▼
+cmd_q ── 选流式方式（私聊草稿 / 群里原地编辑）── 起 pump 协程
+  ▼
+ChatEngine.answer ── 工具循环（最多 ai_max_tool_rounds 轮）
+  │    ├─ ClaudeClient.stream_round ── SSE 逐帧
+  │    ├─ ToolBox.run ── 5 个工具（Bangumi ×3 / Bing / 本地索引）
+  │    └─ tool_result 回灌 ── 再问一遍
+  ▼
+_deliver ── Markdown→HTML → 分片 → ui.reply
+```
+
+三条要点（细节见 [modules/ai.md](modules/ai.md)）：
+
+1. **引擎不认识 Telegram，handler 不认识 SSE。** 中间靠 `on_text(全文)` 这个
+   同步回调连接。所以 `chat.py` / `client.py` / `session.py` 全部可以脱离
+   aiogram 单独测。
+2. **`bot/ui.py` 成了三个模块的公共出口。** `reply()` 决定公开还是 ephemeral，
+   `edit_text()` 按消息类型选 API（ephemeral 消息的 `message_id` 恒为 0）。
+   搜索、漫画、AI 都走它，群聊可见性的规则只有一份。
+3. **`bot/help.py` 抽出了 `render_command_list`。** `/help` 和群里的 `@bot`
+   （不带关键词）共用一份，避免「菜单里有、真发说不认识」。

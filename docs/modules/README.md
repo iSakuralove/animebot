@@ -16,7 +16,8 @@
 | [search.md](search.md) | 应用 | `domain` / `storage` / `config` |
 | [ingest.md](ingest.md) | 应用 | `domain` / `parsing` / `storage`。**可以 import aiogram 类型**（update_adapter 要转 Message） |
 | [bot.md](bot.md) | 应用 | 除 `features` 外都可以 |
-| —（见 [adding_a_feature.md](../adding_a_feature.md)） | 业务 | 都可以，但 **features 之间不互相 import** |
+| [ai.md](ai.md) | 业务（`/q`） | 都可以，但 **features 之间不互相 import** |
+| —（见 [adding_a_feature.md](../adding_a_feature.md)） | 业务 | 同上 |
 
 违反这个顺序的 import 是设计错误，不是权衡。
 

@@ -914,8 +914,25 @@ async def test_notice_shown_immediately_without_reveal() -> None:
     """工具提示不该被回放拖慢 —— 它本来就是「现在在干什么」。"""
     rec = EditRecorder()
     streamer = make_streamer(rec, interval=0.0)
-    streamer.on_text("x" * 400)
     streamer.set_notice("📊 正在翻 Bangumi 榜单…")
     await streamer._flush()
     assert rec.edits
-    assert rec.edits[-1][1].startswith("📊 正在翻 Bangumi 榜单…")
+    assert rec.edits[-1][1] == "📊 正在翻 Bangumi 榜单…"
+
+
+async def test_notice_yields_to_streaming_text() -> None:
+    """正文开始流之后，提示要让位。
+
+    两件事：提示不能被正文永久压在下面（用户看不到「在干什么」），
+    正文开始后也不能被新提示抢屏（那会把正在读的答案换成一句话）。
+    """
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=0.0)
+    streamer.set_notice("🤔 正在思考…")
+    streamer.on_text("答案开头")
+    await streamer._flush()
+    assert rec.edits[-1][1] == "答案开头", "正文一出现就撤掉提示行"
+
+    streamer.set_notice("🌐 正在联网搜索…")
+    await streamer._flush()
+    assert "正在联网搜索" not in rec.edits[-1][1], "正文在流时新提示不抢屏"

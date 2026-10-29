@@ -92,13 +92,24 @@ class EditStreamer:
 
     # ---------------------------------------------------------- 输入
     def on_text(self, body: str) -> None:
-        """收到「到目前为止的完整正文」。回放进度不倒退，除非正文变短了。"""
+        """收到「到目前为止的完整正文」。回放进度不倒退，除非正文变短了。
+
+        正文一出现就撤掉状态行：它只是「现在在干什么」的进度提示，真内容来了
+        就没有意义了。留着会在收尾时突然消失，看起来像消息跳了一下。
+        """
+        if body and self._notice:
+            self._notice = ""
         self._body = body
         self._revealed = min(self._revealed, len(body))
         self._dirty.set()
 
     def set_notice(self, text: str) -> None:
-        """工具调用 / 思考进度这类状态行。立刻刷一版，不等回放。"""
+        """工具调用 / 思考进度这类状态行。立刻刷一版，不等回放。
+
+        但正文已经在流的时候不抢屏 —— 那会把用户正在读的答案换成一句提示。
+        """
+        if self._body:
+            return
         self._notice = text
         self._dirty.set()
 

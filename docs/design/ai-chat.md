@@ -52,20 +52,43 @@
 也在，否则文字会突然消失），最终消息**只取最后一轮** —— 过程话术不该进正式
 回答。`ChatEngine.answer` 用 `round_start` 下标切分这两者。
 
-## 三个工具
+## 五个工具
 
 | 工具 | 调用时机 | 实测 |
 |---|---|---|
-| `bangumi_search` | 评分 / 排名 / 放送日期 | `api.bgm.tv` 500ms；必须 UTF-8 JSON + User-Agent |
+| `bangumi_search` | 有片名：评分 / 排名 / `id` | `api.bgm.tv` 500ms；必须 UTF-8 JSON + User-Agent |
+| `bangumi_detail` | 「这部讲什么」：简介、制作、话数 | `/v0/subjects/{id}`，字段全但噪音多，只回灌白名单 |
+| `bangumi_browse` | 没有片名：「2026 穿越番」「近十年最高分」 | 同一搜索接口的 filter 语法 |
 | `web_search` | 新番、新闻、Bangumi 查不到的 | Bing HTML；DDG 在 VPS 上返回验证页 |
 | `channel_search` | 「频道里发过没」「有没有资源」 | 本地 `SearchService.search()`，5 条/频道 |
 
 工具失败返回 `{"error": "..."}` 而不是抛异常：模型看到错误会自己换策略，
 一次工具挂了不该让整轮对话崩掉。
 
-**`bangumi_search` 的坑**：中文关键词必须用 UTF-8 编码的 JSON body 提交。
-用 `-d` 传中文（curl 默认按系统编码）会得到 `total: 0` —— 看起来像「搜不到」，
-其实是编码坏了。
+### 为什么 `bangumi_browse` 是单独一个工具
+
+`bangumi_search` 只能按片名匹配。用户问「2026 年有什么穿越番推荐」时没有片名，
+拿 search 硬套得到的是垃圾。Bangumi 的搜索接口本身支持 filter
+（`tag` / `air_date` / `rating` / `rating_count` / `rank`），把它暴露给模型就行 ——
+不需要我们再写一层「推荐系统」。
+
+三个实测坑，直接写进了工具描述和代码里：
+
+```
+limit 硬顶 20            传 100 也只回 20，不做客户端翻页
+sort=score 没人数下限      "1 人打 10 分" 的冷门条目会排第一
+sort=rank 有 rank=0       未排名条目排在最前 → 给 max_rank 时加 rank>=1
+```
+
+第 2 条最要命：不设 `rating_count` 时，「近十年评分最高」的答案会是
+《寻灵大冒险》这种 1 人评分的条目。所以 `bangumi_browse` 在 `sort=score|heat`
+且调用方没给 `min_votes` 时**强制**加 `rating_count >= 300`，系统提示里也让
+模型自己给 1000。
+
+### Bangumi 的编码坑
+
+中文关键词必须用 UTF-8 编码的 JSON body 提交。用 `curl -d '{"keyword":"进击的巨人"}'`
+（Windows 下按 GBK 发出去）会得到 `total: 0` —— 看起来像「搜不到」，其实是编码坏了。
 
 ## 流式：`sendMessageDraft`
 

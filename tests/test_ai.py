@@ -443,6 +443,126 @@ async def test_toolbox_unknown_tool(ai_settings: Settings) -> None:
     assert "没有这个工具" in await box.run("nope", {})
 
 
+# ---------------------------------------------------------------- Bangumi 工具
+
+
+class CapturingBox(ToolBox):
+    """不发网络请求，只记录构造出来的请求体。"""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self.posts: list[tuple[dict[str, Any], int]] = []
+        self.gets: list[str] = []
+
+    async def _bgm_post(self, body: dict[str, Any], *, limit: int) -> dict[str, Any]:
+        self.posts.append((body, limit))
+        return {"data": [{"id": 1, "name": "進撃の巨人", "name_cn": "进击的巨人",
+                          "date": "2013-04-06",
+                          "rating": {"score": 8.2, "rank": 114, "total": 32119}}],
+                "total": 32}
+
+    async def _bgm_get(self, url: str) -> dict[str, Any]:
+        self.gets.append(url)
+        return {
+            "id": 55770, "name": "進撃の巨人", "name_cn": "进击的巨人",
+            "platform": "TV", "date": "2013-04-06", "total_episodes": 25,
+            "summary": "人类被巨人捕食。",
+            "tags": [{"name": "热血", "count": 5997}],
+            "infobox": [
+                {"key": "放送开始", "value": "2013年4月6日"},
+                {"key": "导演", "value": "荒木哲郎"},
+                {"key": "别名", "value": [{"v": "Attack on Titan"}, {"v": "AoT"}]},
+                {"key": "价格", "value": "1000 日元"},
+            ],
+            "rating": {"score": 8.2, "rank": 114, "total": 32119,
+                       "count": {"10": 4551, "9": 8032}},
+            "collection": {"wish": 100, "collect": 200, "doing": 30, "dropped": 5},
+        }
+
+
+async def test_bangumi_search_shape(ai_settings: Settings) -> None:
+    box = CapturingBox(ai_settings)
+    payload = json.loads(await box.run("bangumi_search", {"keyword": "进击的巨人"}))
+
+    body, limit = box.posts[0]
+    assert body["filter"]["type"] == [2]
+    assert body["filter"]["nsfw"] is False, "默认排除 R18"
+    assert limit == 10
+    assert payload["total"] == 32
+    row = payload["results"][0]
+    assert (row["score"], row["rank"], row["votes"]) == (8.2, 114, 32119)
+    assert row["url"] == "https://bgm.tv/subject/1"
+
+
+async def test_bangumi_detail_keeps_summary_and_staff(ai_settings: Settings) -> None:
+    box = CapturingBox(ai_settings)
+    row = json.loads(await box.run("bangumi_detail", {"subject_id": 55770}))
+
+    assert box.gets == ["https://api.bgm.tv/v0/subjects/55770"]
+    assert row["episodes"] == 25
+    assert row["platform"] == "TV"
+    assert "人类被巨人捕食" in row["summary"]
+    assert row["staff"]["导演"] == "荒木哲郎"
+    assert row["staff"]["别名"] == "Attack on Titan、AoT", "列表型 infobox 要拼成一句"
+    assert "价格" not in row["staff"], "无关字段不该占 token"
+    assert row["rating_dist"]["10"] == 4551
+    assert row["collection"]["collect"] == 200
+
+
+async def test_bangumi_detail_rejects_bad_id(ai_settings: Settings) -> None:
+    box = CapturingBox(ai_settings)
+    out = await box.run("bangumi_detail", {"subject_id": "进击的巨人"})
+    assert "subject_id 必须是整数" in out
+    assert box.gets == []
+
+
+async def test_bangumi_browse_builds_filters(ai_settings: Settings) -> None:
+    box = CapturingBox(ai_settings)
+    await box.run("bangumi_browse", {
+        "tags": ["穿越"], "year_from": 2026, "year_to": 2026,
+        "min_votes": 500, "sort": "score", "limit": 5,
+    })
+    body, limit = box.posts[0]
+    f = body["filter"]
+    assert body["keyword"] == "", "按条件浏览时 keyword 是空串"
+    assert body["sort"] == "score"
+    assert f["tag"] == ["穿越"]
+    assert f["air_date"] == [">=2026-01-01", "<2027-01-01"]
+    assert f["rating_count"] == [">=500"]
+    assert limit == 5
+
+
+async def test_bangumi_browse_forces_vote_floor_for_score_sort(
+    ai_settings: Settings,
+) -> None:
+    """按评分排序却不设人数下限，会把 1 人打 10 分的冷门条目排第一。"""
+    box = CapturingBox(ai_settings)
+    await box.run("bangumi_browse", {"sort": "score"})
+    assert box.posts[0][0]["filter"]["rating_count"] == [">=300"]
+
+
+async def test_bangumi_browse_excludes_unranked(ai_settings: Settings) -> None:
+    """rank=0 是「还没排上名」。sort=rank 时它们会被排在最前，必须排除。"""
+    box = CapturingBox(ai_settings)
+    await box.run("bangumi_browse", {"max_rank": 100, "sort": "rank"})
+    assert box.posts[0][0]["filter"]["rank"] == [">=1", "<=100"]
+
+
+async def test_bangumi_browse_caps_limit(ai_settings: Settings) -> None:
+    box = CapturingBox(ai_settings)
+    await box.run("bangumi_browse", {"limit": 999})
+    assert box.posts[0][1] == 20, "服务端硬顶 20"
+
+
+async def test_bangumi_token_goes_in_header(ai_settings: Settings) -> None:
+    from pydantic import SecretStr
+
+    cfg = ai_settings.model_copy(update={"bgm_token": SecretStr("tok-123")})
+    box = ToolBox(cfg)
+    assert box._bgm_headers()["Authorization"] == "Bearer tok-123"
+    assert "Authorization" not in ToolBox(ai_settings)._bgm_headers(), "没配就不带"
+
+
 # ---------------------------------------------------------------- 草稿流
 
 

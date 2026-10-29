@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     ai_session_messages: int = Field(default=16, ge=2, le=64)
     # 联网搜索走 Bing（VPS 直连可用，DDG 会返回人机验证页）。
     ai_search_timeout: float = Field(default=15.0, gt=0)
+    # Bangumi Access Token（next.bgm.tv/demo/access-token）。带上之后限流更宽，
+    # 而且能拿到 NSFW 标记做过滤。不带也能用，只是慢且容易被 429。
+    bgm_token: SecretStr = SecretStr("")
 
     # ---- 可观测性 ----
     log_level: str = "INFO"

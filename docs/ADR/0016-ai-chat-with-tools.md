@@ -26,8 +26,20 @@
 | 工具 | 数据源 | 为什么必须是我们做 |
 |---|---|---|
 | `bangumi_search` | `api.bgm.tv/v0/search/subjects` | 评分会变，模型记忆必然过期 |
+| `bangumi_detail` | `/v0/subjects/{id}` | 「这部讲什么」要简介和制作人员，模型会编 |
+| `bangumi_browse` | 同一搜索接口的 filter | 「今年有什么穿越番」没有片名可搜，只能按条件列榜 |
 | `web_search` | Bing HTML | 网关丢服务端工具，只能自己搜完回灌 |
 | `channel_search` | 本地 SQLite（复用 `SearchService`） | 这是我们独有的数据 |
+
+`bangumi_browse` 暴露的是 Bangumi 自己的 filter 语法（`tag` / `air_date` /
+`rating` / `rating_count` / `rank`），不是我们造的 DSL。三个实测坑写进了工具描述
+里，让模型自己避开：
+
+- `limit` 服务端硬顶 20，传 100 也只回 20；
+- `sort=score` 会把「1 人打 10 分」的冷门条目顶到第一 —— 按评分排序时强制
+  加 `rating_count >= 300`（除非调用方自己给了更严的 `min_votes`）；
+- `sort=rank` 会把未排名条目（`rank=0`）排在最前 —— 给 `max_rank` 时强制
+  加 `rank >= 1`。
 
 **流式用 `sendMessageDraft`。** Bot API 9.5 引入，是唯一能给 Telegram 做
 「逐字生成」的接口。它画的是**临时草稿**（30 秒自动消失），生成结束后必须

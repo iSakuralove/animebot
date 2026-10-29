@@ -125,7 +125,9 @@ JSON 的形状，再喂给和回填完全相同的 `parse_message`。两份解�
 **AI 对话用 Claude 协议 + 自己做工具循环。** 网关把服务端工具静默丢弃，
 所以 Bangumi（搜索 / 详情 / 榜单）、网页搜索、频道检索都得我们实现再回灌 ——
 好处是「频道里发过没」「近十年最高分是哪部」这种问题模型真的能答。流式是「先发占位消息、再原地 edit 它」——
-不用 `sendMessageDraft`：它画的临时草稿会和最终消息同时可见，看起来像回了两遍。见
+不用 `sendMessageDraft`：它画的临时草稿会和最终消息同时可见，看起来像回了两遍。
+网关的正文是**一次性涌入**的（0.7 秒 130 个 delta），所以还加了一层回放，
+把已收到的内容按人能读的节奏放出来。见
 [ADR-0016](docs/ADR/0016-ai-chat-with-tools.md)。
 
 **不用 FTS5。** 实测 trigram tokenizer 对中文 2 字查询全部未命中（要求至少
@@ -186,7 +188,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-467 个测试。四个是回归红线：
+471 个测试。四个是回归红线：
 
 - [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实动漫帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。

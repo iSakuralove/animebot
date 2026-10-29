@@ -7,12 +7,29 @@
 
 所以改成最朴素的办法：**先发一条占位消息，然后原地 edit 它**。一条消息从头
 长到尾，聊天记录里始终只有一条，私聊和群里的 ephemeral 都适用
-（`bot.ui.edit_text` 负责这两条 API 的分叉）。代价是编辑有节流 —— Telegram
-对同一聊天大约 1 次/秒，所以按 `interval` 攒一版再刷；撞 429 就把间隔乘上去，
-不做重试风暴。
+（`bot.ui.edit_text` 负责这两条 API 的分叉）。
 
-最终文本可能超过 4096，所以要分片：第一片编辑进占位消息，其余各发一条
-（走调用方给的 `send_extra`，它知道群里该不该用 ephemeral）。
+## 为什么要自己控制「显示进度」
+
+实测网关的吐字节奏（2026-10-29，deepseek-v4.1-flash）：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| 思考（强制 thinking，关不掉） | 1~3s | 一个正文 token 都没有 |
+| 工具调用 | 0.3~4s | Bangumi / Bing 往返 |
+| 正文 | **0.7s 出 130 个 delta** | 一次性涌进来 |
+
+正文只有一个「突发」，不是稳定细流。直接把最新文本刷上去的话，用户在
+0.7 秒里看不到任何中间态 —— 观感就是「没有流式」。所以这里加了一层**回放**：
+每次 tick 只把接收缓冲区往前推一段（约剩余量的 35%，最少 24 字），
+450 字的回答大约 2 秒长完。这不是造假，是把「已经拿到的内容」按人能读的
+节奏放出来；`finish()` 仍然一次写完整文本，不做任何截断。
+
+## 节流
+
+一手实测：同一条消息连刷 0.2s 一版 10/10 全过、不报 429（编辑不像
+`sendMessage` 那样每次都推通知）。0.25s 是「看得出在长」和「别浪费往返」的
+折中。撞 429 就把间隔乘 1.6（上限 6s），重试这一版，不做重试风暴。
 """
 
 from __future__ import annotations
@@ -29,23 +46,35 @@ from ...observability.logging import get_logger
 
 log = get_logger("animebot.ai.stream")
 
-#: 两次编辑之间的间隔。1 秒是 Telegram 的软限，留点余量。
-_MIN_INTERVAL = 1.4
+#: 两次编辑之间的间隔（按「上一次发出」起算，含网络往返）。
+_MIN_INTERVAL = 0.25
 _MAX_INTERVAL = 6.0
 #: 单条消息的字符预算。Telegram 上限 4096，HTML 实体还会再涨一些。
 _MESSAGE_CAP = 3500
+#: 每次 tick 至少推进这么多字。太小会让短回答磨很久，太大就回到「一次蹦完」。
+_REVEAL_MIN = 24
+#: 每次 tick 推进剩余量的比例。0.35 让 450 字大约 2 秒长完。
+_REVEAL_RATIO = 0.35
 
 #: 续篇发送器：收到（可带 parse_mode=None 的）文本，发出去。由 handler 提供，
 #: 群里走 ephemeral。超长回答和 HTML 降级都靠它补后续分片。
 SendExtra = Callable[..., Awaitable[object]]
 
 
+def compose(notice: str, body: str) -> str:
+    """占位消息正文：状态提示一行 + 已生成的部分。"""
+    body = body.strip()
+    if notice and body:
+        return f"{notice}\n\n{body}"
+    return notice or body
+
+
 @dataclass(slots=True)
 class EditStreamer:
-    """占位消息 + 节流原地编辑。
+    """占位消息 + 节流原地编辑 + 正文回放。
 
-    `on_text` 是同步回调（在解析 SSE 的循环里调），只记最新文本并置 dirty；
-    真正的网络请求由 `pump` 协程发 —— 在解析循环里 await 会拖慢读流。
+    `on_text` 是同步回调（在解析 SSE 的循环里调），只记文本并置 dirty；
+    真正的网络请求和回放节奏由 `pump` 协程控制 —— 在解析循环里 await 会拖慢读流。
     """
 
     bot: Bot
@@ -53,33 +82,47 @@ class EditStreamer:
     render: Callable[[str], str]
     send_extra: SendExtra
     interval: float = _MIN_INTERVAL
-    _latest: str = ""
+    _notice: str = ""
+    _body: str = ""
+    _revealed: int = 0
     _shown: str = ""
     _dirty: asyncio.Event = field(default_factory=asyncio.Event)
     _stopping: bool = False
     _broken: bool = False
 
     # ---------------------------------------------------------- 输入
-    def on_text(self, text: str) -> None:
-        self._latest = text
+    def on_text(self, body: str) -> None:
+        """收到「到目前为止的完整正文」。回放进度不倒退，除非正文变短了。"""
+        self._body = body
+        self._revealed = min(self._revealed, len(body))
         self._dirty.set()
 
-    def push_now(self, text: str) -> None:
-        """工具调用之类的关键节点：改内容并立刻刷一版。"""
-        self._latest = text
+    def set_notice(self, text: str) -> None:
+        """工具调用 / 思考进度这类状态行。立刻刷一版，不等回放。"""
+        self._notice = text
         self._dirty.set()
 
     # ---------------------------------------------------------- 泵
     async def pump(self) -> None:
-        """有变化就按节流编辑一版。被 cancel 时静默退出。"""
+        """有变化就按节流编辑一版。被 cancel 时静默退出。
+
+        节流按「两次**发出**之间的间隔」算：`_flush` 本身要一个网络往返
+        （VPS 直连约 150ms），把它算进间隔才能保证节奏稳定。
+        """
+        loop = asyncio.get_running_loop()
         try:
             while not self._stopping:
                 await self._dirty.wait()
                 self._dirty.clear()
                 if self._stopping:
                     return
+                started = loop.time()
                 await self._flush()
-                await asyncio.sleep(self.interval)
+                # 回放还没追上接收缓冲区：这一版不是终点，继续排下一版。
+                # 少了这一步，正文会在第一版之后就停住，等下一次真实 delta 才动。
+                if self._revealed < len(self._body) and not self._broken:
+                    self._dirty.set()
+                await asyncio.sleep(max(0.0, self.interval - (loop.time() - started)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -88,7 +131,8 @@ class EditStreamer:
     async def _flush(self) -> None:
         if self._broken:
             return
-        text = self.render(self._latest[:_MESSAGE_CAP])
+        self._advance()
+        text = self.render(self._visible[:_MESSAGE_CAP])
         if not text or text == self._shown:
             return
         try:
@@ -107,18 +151,37 @@ class EditStreamer:
             self._broken = True
             log.info("ai.stream_edit_failed", error=str(exc)[:120])
 
+    def _advance(self) -> None:
+        """把回放进度往前推一段。收尾阶段（`_stopping`）直接到头。"""
+        remaining = len(self._body) - self._revealed
+        if remaining <= 0:
+            return
+        if self._stopping:
+            self._revealed = len(self._body)
+            return
+        step = max(_REVEAL_MIN, int(remaining * _REVEAL_RATIO + 0.999))
+        self._revealed = min(len(self._body), self._revealed + step)
+
+    @property
+    def _visible(self) -> str:
+        return compose(self._notice, self._body[: self._revealed])
+
+    @property
+    def latest(self) -> str:
+        """当前已经在屏幕上显示的内容。用户按停止时用来保留半截答案。"""
+        return self._visible
+
     # ---------------------------------------------------------- 收尾
     def stop(self) -> None:
         self._stopping = True
         self._dirty.set()
 
-    @property
-    def latest(self) -> str:
-        """到目前为止显示过的最新文本。用户按停止时用来保留半截答案。"""
-        return self._latest
-
     async def finish(self, markdown: str, **kw: object) -> None:
-        """把最终回答写进占位消息；超长时其余分片另起消息。"""
+        """把最终回答写进占位消息；超长时其余分片另起消息。
+
+        这里不经过回放：`_stopping` 置位后 `_advance` 直接到头，完整的最终
+        文本一次写完 —— 收尾必须准，不能因为「还没播完」而截断。
+        """
         self._stopping = True
         chunks = split_text(markdown)
         first, rest = chunks[0], chunks[1:]

@@ -110,13 +110,36 @@ sort=rank 有 rank=0       未排名条目排在最前 → 给 max_rank 时加 r
 （`bot/ui.edit_text` 按 `ephemeral_message_id` 走 `editMessageText` 或
 `editEphemeralMessageText`）。
 
+### 为什么还要「回放」
+
+一手实测（2026-10-29，deepseek-v4.1-flash）：
+
+| 阶段 | 耗时 | 产出 |
+|---|---|---|
+| 思考（强制 thinking，关不掉） | 1~3s | 零个正文 token |
+| 工具调用 | 0.3~4s | 零个正文 token |
+| 正文 | **0.7s 出 130 个 delta** | 一整段，一次性涌进来 |
+
+正文只有一个「突发」，不是稳定细流。直接把最新文本刷上去，用户在 0.7 秒里
+看不到任何中间态 —— 观感就是「没有流式」。
+
+所以 `EditStreamer` 多了一层回放：`on_text` 收到的是完整正文（进缓冲区），
+每次 tick 只把**显示进度**往前推一段（剩余量的 35%，最少 24 字）。
+470 字的回答在本地代理下刷 7 版、在 VPS 直连下大约 8~10 版，肉眼能看出在长。
+
+这不造假：回放的全是已经拿到的真实内容；`finish()` 仍然一次写完整文本，
+`_stopping` 置位后 `_advance` 直接到头，不会因为「还没播完」而截断。
+
 ### 节流与 429
 
-Telegram 对同一聊天的编辑大约 1 次/秒。所以 `EditStreamer` 不在 SSE 解析循环
-里 await（那会拖慢读流），而是：
+实测：同一条消息连刷 0.2s 一版 10/10 全过、不报 429 —— 编辑不像 `sendMessage`
+那样每次都产生推送，限流宽得多。所以 `interval` 取 0.25s。
+
+`EditStreamer` 不在 SSE 解析循环里 await（那会拖慢读流），而是：
 
 - `on_text` 只记最新文本 + 置 dirty（同步，微秒级）
-- `pump()` 协程每 `interval` 秒刷一版
+- `pump()` 协程每 `interval` 秒刷一版（按「上一次发出」起算，含网络往返）
+- 回放没追上缓冲区时立刻排下一版，不等新的 delta
 - 撞 `TelegramRetryAfter` 就把间隔乘 1.6（上限 6 秒）并重试这一版
 
 ### 停止按钮

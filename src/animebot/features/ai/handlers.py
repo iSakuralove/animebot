@@ -131,16 +131,13 @@ async def cmd_q(
             )
             pump_task = asyncio.create_task(streamer.pump())
 
-        status = {"notice": ""}
-
         def on_text(so_far: str) -> None:
             if streamer is not None:
-                streamer.on_text(_compose(status["notice"], so_far))
+                streamer.on_text(so_far)
 
         def on_notice(text: str) -> None:
-            status["notice"] = text
             if streamer is not None:
-                streamer.push_now(text)
+                streamer.set_notice(text)
 
         result = await engine.answer(
             conversation, arg, on_text=on_text, on_notice=on_notice, cancel=cancel
@@ -197,14 +194,6 @@ async def cmd_q(
         METRICS.incr("ai.html_fallback")
         log.info("ai.html_fallback", error=str(exc)[:120])
         await streamer.finish_plain(result.text, reply_markup=_NO_BUTTONS)
-
-
-def _compose(notice: str, body: str) -> str:
-    """占位消息正文：状态提示一行 + 已生成的正文。"""
-    body = body.strip()
-    if notice and body:
-        return f"{notice}\n\n{body}"
-    return notice or body
 
 
 async def _stop_pump(streamer: EditStreamer | None, task: asyncio.Task[None] | None) -> None:

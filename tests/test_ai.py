@@ -852,3 +852,70 @@ async def test_stop_button_cancels_running_generation(
     await ai_handlers.on_stop(cb)
     assert cancel.is_set(), "取消信号必须被置位"
     assert answered == ["正在停止…"], "点一下要立刻有反馈，否则用户以为没点上"
+
+
+async def test_thinking_progress_is_reported(ai_settings: Settings) -> None:
+    """模型强制 thinking，期间没有任何 text_delta。不报进度用户会以为卡死。"""
+    class SlowClient(FakeClient):
+        async def stream_round(self, messages, *, tools=None, system=None,
+                               on_text=None, on_thinking=None, cancel=None, model=None):
+            if on_thinking is not None:
+                for _ in range(5):
+                    on_thinking("想" * 200)      # 累计 1000 字
+            return await super().stream_round(
+                messages, tools=tools, system=system, on_text=on_text,
+                on_thinking=on_thinking, cancel=cancel, model=model,
+            )
+
+    engine = ChatEngine(ai_settings, SlowClient([text_round("答")]), FakeTools())  # type: ignore[arg-type]
+    notices: list[str] = []
+    await engine.answer(
+        ConversationStore().get((1, 1)), "问", on_notice=notices.append
+    )
+    assert any("正在思考" in n for n in notices), f"要报思考进度，实际 {notices}"
+    assert any("字" in n for n in notices)
+
+
+async def test_reveal_paces_bursty_text_into_multiple_frames() -> None:
+    """网关把整段正文一次性推过来（实测 0.7s 出 130 个 delta）。
+
+    不控制回放的话，用户 0.7 秒里看不到任何中间态 —— 观感就是「没有流式」。
+    """
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=0.0)
+    body = "".join(f"第{i}句。" for i in range(100))      # 400 字
+    streamer.on_text(body)
+
+    task = asyncio.create_task(streamer.pump())
+    await asyncio.sleep(0.05)
+    streamer.stop()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    lengths = [len(text) for _, text in rec.edits]
+    assert len(lengths) >= 4, f"应该分多版长出来，实际 {lengths}"
+    assert lengths == sorted(lengths), "回放进度不能倒退"
+    assert lengths[0] < len(body) * 0.8, "第一版不能一次蹦完全文"
+    assert lengths[0] >= 24, "第一版至少给几个字，别一上来只有一个字"
+
+
+async def test_reveal_finishes_immediately_on_finish() -> None:
+    """收尾必须准：finish 之后屏幕上就是完整文本，不能卡在回放中途。"""
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=999.0)   # 泵几乎不跑
+    body = "x" * 400
+    streamer.on_text(body)
+    await streamer.finish(body)
+    assert rec.edits and rec.edits[-1][1] == body
+
+
+async def test_notice_shown_immediately_without_reveal() -> None:
+    """工具提示不该被回放拖慢 —— 它本来就是「现在在干什么」。"""
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=0.0)
+    streamer.on_text("x" * 400)
+    streamer.set_notice("📊 正在翻 Bangumi 榜单…")
+    await streamer._flush()
+    assert rec.edits
+    assert rec.edits[-1][1].startswith("📊 正在翻 Bangumi 榜单…")

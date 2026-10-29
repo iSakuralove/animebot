@@ -124,6 +124,11 @@ class ChatEngine:
         last_round = None
         calls = 0
         rounds = 0
+        # 模型强制 thinking（网关不给关），这段时间一个 text_delta 都没有。
+        # 不报进度的话用户看到的是「正在思考…」定住不动，和卡死没区别。
+        # 按时间报而不是按字数：实测一段思考可能只有 300 字但要 1 秒，
+        # 按字数阈值可能一次都不触发。
+        thinking = {"chars": 0, "last": 0.0}
 
         for round_index in range(self._cfg.ai_max_tool_rounds + 1):
             if cancel is not None and cancel.is_set():
@@ -137,6 +142,21 @@ class ChatEngine:
             round_tools = None if force_final else tools
             round_start = len(streaming)
 
+            loop = asyncio.get_running_loop()
+
+            def on_thinking(
+                piece: str, _st: dict[str, Any] = thinking,
+                _loop: asyncio.AbstractEventLoop = loop,
+            ) -> None:
+                if on_notice is None:
+                    return
+                _st["chars"] += len(piece)
+                now = _loop.time()
+                if now - _st["last"] < 1.0:   # 最多一秒刷一次，别把编辑额度刷爆
+                    return
+                _st["last"] = now
+                on_notice(f"🤔 正在思考…（已想 {_st['chars']} 字）")
+
             def collect(piece: str, _buf: list[str] = streaming) -> None:
                 # 契约：on_text 收到的是「到目前为止的完整文本」，不是增量 ——
                 # 上层直接把它渲染成一版草稿，不做拼接。
@@ -144,7 +164,9 @@ class ChatEngine:
                 if on_text is not None:
                     on_text("".join(_buf))
 
-            last_round = await self._request(history, round_tools, system, collect, cancel)
+            last_round = await self._request(
+                history, round_tools, system, collect, on_thinking, cancel
+            )
 
             assistant_blocks = [b for b in last_round.content if b["type"] in ("text", "tool_use")]
             if not assistant_blocks:
@@ -201,6 +223,7 @@ class ChatEngine:
         tools: list[dict[str, Any]] | None,
         system: str,
         on_text: Callable[[str], None],
+        on_thinking: Callable[[str], None] | None,
         cancel: asyncio.Event | None,
     ):
         """一轮请求，带主模型 → 兜底模型的降级。
@@ -216,6 +239,7 @@ class ChatEngine:
                 tools=tools,
                 system=system,
                 on_text=on_text,
+                on_thinking=on_thinking,
                 cancel=cancel,
                 model=primary,
             )
@@ -230,6 +254,7 @@ class ChatEngine:
                 tools=tools,
                 system=system,
                 on_text=on_text,
+                on_thinking=on_thinking,
                 cancel=cancel,
                 model=fallback,
             )

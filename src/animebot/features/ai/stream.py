@@ -138,7 +138,8 @@ class _Pacer:
         self._revealed = 0
         self._shown = ""
         self._dirty = asyncio.Event()
-        self._stopping = False
+        self._halt = False      # 泵该退出了（不再抢着推）
+        self._final = False     # 收尾阶段：回放直接到头（编辑模式要完整文本）
         self._broken = False
         self._started: float | None = None   # 正文第一次到达的时刻
         self._tick = 0
@@ -151,8 +152,6 @@ class _Pacer:
         正文一出现就撤掉状态行：它只是「现在在干什么」的进度提示，真内容来了
         就没有意义了。留着会在收尾时突然消失，看起来像消息跳了一下。
         """
-        if body and self._notice:
-            self._notice = ""
         if body and self._started is None:
             self._started = self._clock()
         self._body = body
@@ -164,7 +163,7 @@ class _Pacer:
 
         但正文已经在流的时候不抢屏 —— 那会把用户正在读的答案换成一句提示。
         """
-        if self._body:
+        if len(self._body) >= _REVEAL_MIN_CHARS:
             return
         self._notice = text
         self._dirty.set()
@@ -177,10 +176,10 @@ class _Pacer:
         把它算进间隔才能保证节奏稳定。
         """
         try:
-            while not self._stopping:
+            while not self._halt:
                 await self._dirty.wait()
                 self._dirty.clear()
-                if self._stopping:
+                if self._halt:
                     return
                 started = self._clock()
                 await self._flush()
@@ -198,7 +197,8 @@ class _Pacer:
             return
         self._advance()
         text = self.render(self._visible[:_MESSAGE_CAP])
-        if text and self._body and not self._stopping:
+        _body_on_screen = len(self._body) >= _REVEAL_MIN_CHARS and not self._final
+        if text and _body_on_screen and self._revealed:
             # 隔帧切光标：Telegram 没有原生打字光标，自己画一个才有「还在写」的观感。
             self._tick += 1
             if self._tick % 2 == 1:
@@ -236,7 +236,7 @@ class _Pacer:
         total = len(self._body)
         if self._revealed >= total:
             return
-        if self._stopping or self._started is None:
+        if self._final or self._started is None:
             self._revealed = total
             return
         elapsed = max(0.0, self._clock() - self._started)
@@ -253,10 +253,11 @@ class _Pacer:
         while self._revealed < len(self._body) and self._clock() < deadline:
             if self._broken:
                 return
+            started = self._clock()
             await self._flush()
             if self._revealed >= len(self._body):
                 return
-            await asyncio.sleep(max(0.0, self.interval - 0.0))
+            await asyncio.sleep(max(0.0, self.interval - (self._clock() - started)))
 
     @property
     def frames(self) -> int:
@@ -265,7 +266,15 @@ class _Pacer:
 
     @property
     def _visible(self) -> str:
-        return compose(self._notice, self._body[: self._revealed])
+        """当前该显示什么。
+
+        正文还只有一两个字时继续显示提示行（模型是一个 delta 一个字地吐）。
+        弹出一帧「近▌」再跳到几十字，比多等 50ms 难看得多。够长了就切成
+        正文，提示行撤掉 —— 它只是「现在在干什么」。
+        """
+        if self._final or len(self._body) >= _REVEAL_MIN_CHARS:
+            return self._body[: self._revealed]
+        return self._notice
 
     @property
     def latest(self) -> str:
@@ -273,7 +282,8 @@ class _Pacer:
         return self._visible
 
     def stop(self) -> None:
-        self._stopping = True
+        """让泵退出。回放**不跳到头** —— 编辑模式由 `finish` 精确定稿。"""
+        self._halt = True
         self._dirty.set()
 
 
@@ -317,10 +327,11 @@ class DraftStreamer(_Pacer):
         强制跳会让最后一眼是「啪一下变全文」，正是用户说的僵硬。
         编辑模式相反 —— 那一条就是最终消息，必须完整（见 `finish`）。
         """
+        # 先让泵退出，否则它和 drain 会同时推，旧文本可能覆盖新的（视觉回缩）。
+        self.stop()
         with contextlib.suppress(TelegramBadRequest, TelegramRetryAfter):
             await self.drain()
         await asyncio.sleep(_SETTLE)
-        self.stop()
 
 
 class EditStreamer(_Pacer):
@@ -347,10 +358,11 @@ class EditStreamer(_Pacer):
     async def finish(self, markdown: str, **kw: object) -> None:
         """把最终回答写进占位消息；超长时其余分片另起消息。
 
-        这里不经过回放：`_stopping` 置位后 `_advance` 直接到头，完整的最终
+        这里不经过回放：`_final` 置位后 `_advance` 直接到头，完整的最终
         文本一次写完 —— 收尾必须准，不能因为「还没播完」而截断。
         """
-        self._stopping = True
+        self._final = True
+        self._halt = True
         chunks = split_text(markdown)
         first, rest = chunks[0], chunks[1:]
         try:
@@ -366,7 +378,8 @@ class EditStreamer(_Pacer):
 
         必须**编辑**占位消息而不是另发 —— 另发就又变成两条重复内容了。
         """
-        self._stopping = True
+        self._final = True
+        self._halt = True
         chunks = split_text(markdown)
         first, rest = chunks[0], chunks[1:]
         try:

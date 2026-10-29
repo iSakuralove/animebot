@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import json
 from collections.abc import AsyncIterator
@@ -603,20 +602,25 @@ def make_streamer(rec: EditRecorder, **kw: Any) -> EditStreamer:
 async def test_streamer_edits_one_message_in_place() -> None:
     """一条消息从头长到尾 —— 不能每版都发新消息（那正是「回了两遍」的来源）。"""
     rec = EditRecorder()
-    streamer = make_streamer(rec, interval=0.0)
-    streamer.on_text("评分")
-    task = asyncio.create_task(streamer.pump())
-    await asyncio.sleep(0.05)
-    streamer.on_text("评分 8.2")
-    await asyncio.sleep(0.05)
-    streamer.stop()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    now = [0.0]
+    streamer = make_streamer(rec, interval=0.0, clock=lambda: now[0])
+
+    body1 = "进击的巨人评分 8.2 排名 114"
+    streamer.on_text(body1)
+    await streamer._flush()                      # 第一版
+
+    body2 = body1 + "，共 32119 人打分"
+    streamer.on_text(body2)
+    for _ in range(4):                           # 时间推进，正文继续长
+        now[0] += 0.3
+        await streamer._flush()
 
     assert rec.sent == [], "过程中一条新消息都不该发"
-    assert [m for m, _ in rec.edits] == [77, 77], "始终编辑同一条"
-    assert "8.2" in rec.edits[-1][1]
+    assert {m for m, _ in rec.edits} == {77}, "始终编辑同一条消息"
+    assert len(rec.edits) >= 2, "过程中应该刷了不止一版"
+    lengths = [len(t.rstrip("▌")) for _, t in rec.edits]
+    assert lengths == sorted(lengths), "回放不能倒退"
+    assert lengths[-1] > lengths[0], "时间推进后应该更长"
 
 
 async def test_streamer_finish_edits_placeholder_and_sends_overflow() -> None:
@@ -637,7 +641,7 @@ async def test_streamer_throttle_error_does_not_kill_output() -> None:
         method=None, message="flood", retry_after=0  # type: ignore[arg-type]
     )
     streamer = make_streamer(rec, interval=0.0)
-    streamer.on_text("x")
+    streamer.on_text("进击的巨人评分 8.2，排名 114")
     await streamer._flush()
     assert streamer.interval > 0, "撞限流后要放慢节奏"
     assert not streamer._broken, "限流是可恢复的，不该放弃后续输出"
@@ -652,7 +656,7 @@ async def test_streamer_gives_up_on_bad_edit() -> None:
         message="Bad Request: message to edit not found",
     )
     streamer = make_streamer(rec, interval=0.0)
-    streamer.on_text("x")
+    streamer.on_text("进击的巨人评分 8.2，排名 114")
     await streamer._flush()
     assert streamer._broken is True
 
@@ -959,6 +963,21 @@ async def test_notice_shown_immediately_without_reveal() -> None:
     assert rec.edits[-1][1] == "📊 正在翻 Bangumi 榜单…"
 
 
+async def test_tiny_body_waits_instead_of_flashing() -> None:
+    """模型是一个 delta 一个字地吐。正文只有一两个字时先别露 —— 弹一帧
+    「近▌」再跳到几十字，比多等 50ms 难看得多。"""
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=0.0)
+    streamer.set_notice("🤔 正在思考…")
+    streamer.on_text("近")
+    await streamer._flush()
+    assert rec.edits and rec.edits[-1][1] == "🤔 正在思考…", "太短的正文先不露"
+
+    streamer.on_text("近十年评分最高的动画是 3月的狮子 第二季")
+    await streamer._flush()
+    assert "近十年" in rec.edits[-1][1], "够长了就露出来"
+
+
 async def test_notice_yields_to_streaming_text() -> None:
     """正文开始流之后，提示要让位。
 
@@ -968,7 +987,7 @@ async def test_notice_yields_to_streaming_text() -> None:
     rec = EditRecorder()
     streamer = make_streamer(rec, interval=0.0)
     streamer.set_notice("🤔 正在思考…")
-    streamer.on_text("答案开头")
+    streamer.on_text("答案开头就是这一句，后面还有更多内容")
     await streamer._flush()
     assert rec.edits[-1][1].startswith("答案开头"), "正文一出现就撤掉提示行"
     assert "正在思考" not in rec.edits[-1][1]

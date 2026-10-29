@@ -1,24 +1,32 @@
 """`/q` 指令：AI 对话入口。
 
-分工：这个文件只管 Telegram 的事（草稿流、停止按钮、把长文分片发出去），
+分工：这个文件只管 Telegram 的事（占位消息、停止按钮、把长文分片发出去），
 模型和工具循环在 chat.py，协议细节在 client.py。
 
-流式只在私聊做。`sendMessageDraft` 的 chat_id 参数文档写的是 private chat，
-群里的回复本来就走 ephemeral，再套草稿没有意义（草稿没有 ephemeral 版本，
-会把别人的搜索过程公开）。
+**流式做法：先发一条占位消息，然后原地 edit 它。** 不用 `sendMessageDraft` ——
+它画的是临时草稿，会和最终消息同时出现在聊天里（看起来像回了两遍），而且只
+支持私聊。edit 方案一条消息从头长到尾，私聊和群里都成立。
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import random
+import itertools
+import secrets
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import LinkPreviewOptions, Message, MessageGenerationStopped
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Message,
+)
 
 from ..._util import command_arg
+from ...bot.ui import discard, edit_text
 from ...bot.ui import reply as ui_reply
 from ...config import Settings
 from ...core.errors import UsageError
@@ -30,21 +38,32 @@ from .chat import ChatEngine
 from .client import Stopped
 from .render import to_telegram_html
 from .session import ConversationStore
-from .stream import DraftStreamer, split_text
+from .stream import EditStreamer, split_text
 
 log = get_logger("animebot.ai")
 
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+#: 编辑时传空键盘 = 摘掉按钮（传 None 是「不改」，按钮会留在消息上）。
+_NO_BUTTONS = InlineKeyboardMarkup(inline_keyboard=[])
 _RESET_WORDS = frozenset({"reset", "clear", "重置", "新对话", "清空"})
+_PLACEHOLDER = "🤔 正在思考…"
 
-#: draft_id -> 取消信号。用户点「停止生成」时 Telegram 推 stopped_message_generation，
-#: 里面只有 draft_id，所以映射只能按它建。
-_CANCELS: dict[int, asyncio.Event] = {}
+#: 正在跑的生成：短 id -> 取消信号。id 编进「停止」按钮的 callback_data。
+_GENERATIONS: dict[str, asyncio.Event] = {}
+_SEQ = itertools.count(1)
 
 
-def new_draft_id() -> int:
-    """草稿 id 必须非零，且同一 chat 内同时只有一条在刷 —— 随机足够。"""
-    return random.getrandbits(31) | 1
+def _new_generation() -> tuple[str, asyncio.Event]:
+    gid = f"{next(_SEQ):x}{secrets.token_hex(2)}"
+    cancel = asyncio.Event()
+    _GENERATIONS[gid] = cancel
+    return gid, cancel
+
+
+def _stop_keyboard(gid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⏹ 停止", callback_data=f"qs:{gid}")]]
+    )
 
 
 @command(
@@ -54,13 +73,15 @@ def new_draft_id() -> int:
     aliases=("ask", "ai"),
     rate=(4, 60),
     long_help=(
-        "带工具的知识问答。它会自己决定查 Bangumi、联网搜索还是翻频道索引，"
-        "答案是流式的（私聊里能看到逐字生成）。\n\n"
+        "带工具的知识问答。它会自己决定查 Bangumi（搜条目 / 看详情 / 列榜单）、"
+        "联网搜索还是翻频道索引，答案边生成边显示在同一条消息里。\n\n"
         "会记住上下文，追问不用重复背景。/q 重置 开新对话。\n\n"
         "例子:\n"
         "/q 进击的巨人在 bangumi 上评分多少？\n"
-        "/q 频道里有葬送的芙莉莲吗\n"
-        "/q 今年七月番里评分最高的是哪部"
+        "/q 春物评分多少？讲了什么\n"
+        "/q 2026 年有什么穿越番推荐\n"
+        "/q 近十年评分最高的动画\n"
+        "/q 频道里有葬送的芙莉莲吗"
     ),
 )
 async def cmd_q(
@@ -88,27 +109,39 @@ async def cmd_q(
 
     bind(query=arg[:80], model=settings.ai_model)
     conversation = conversations.get(key)
-
-    streamer = _make_streamer(message)
+    gid, cancel = _new_generation()
+    streamer: EditStreamer | None = None
     pump_task: asyncio.Task[None] | None = None
-    if streamer is not None:
-        _CANCELS[streamer.draft_id] = cancel = asyncio.Event()
-        pump_task = asyncio.create_task(streamer.pump())
-    else:
-        cancel = asyncio.Event()
-
-    status = {"notice": ""}
-
-    def on_text(so_far: str) -> None:
-        if streamer is not None:
-            streamer.on_text(_compose(status["notice"], so_far))
-
-    def on_notice(text: str) -> None:
-        status["notice"] = text
-        if streamer is not None:
-            streamer.push_now(_compose(text, ""))
 
     try:
+        sent = await ui_reply(
+            message,
+            _PLACEHOLDER,
+            reply_markup=_stop_keyboard(gid),
+            link_preview_options=_NO_PREVIEW,
+        )
+        if sent is not None and message.bot is not None:
+            streamer = EditStreamer(
+                bot=message.bot,
+                sent=sent,
+                render=to_telegram_html,
+                send_extra=lambda html, **kw: ui_reply(
+                    message, html, link_preview_options=_NO_PREVIEW, **kw
+                ),
+            )
+            pump_task = asyncio.create_task(streamer.pump())
+
+        status = {"notice": ""}
+
+        def on_text(so_far: str) -> None:
+            if streamer is not None:
+                streamer.on_text(_compose(status["notice"], so_far))
+
+        def on_notice(text: str) -> None:
+            status["notice"] = text
+            if streamer is not None:
+                streamer.push_now(text)
+
         result = await engine.answer(
             conversation, arg, on_text=on_text, on_notice=on_notice, cancel=cancel
         )
@@ -116,19 +149,27 @@ async def cmd_q(
         METRICS.incr("ai.stopped")
         bind(stopped=True)
         if streamer is not None:
-            streamer.stop()
-        await _retract(streamer)
-        await ui_reply(message, "⏹ 已停止生成。")
+            await _stop_pump(streamer, pump_task)
+            pump_task = None
+            partial = streamer.latest.strip()
+            note = "⏹ 已停止生成。"
+            with contextlib.suppress(TelegramBadRequest):
+                await streamer.finish(
+                    f"{note}\n\n{partial}" if partial else note,
+                    reply_markup=_NO_BUTTONS,
+                )
         return
+    except Exception:
+        # 删掉占位消息，把错误交回 ErrorBoundary —— 它本来就会发一条带 trace_id
+        # 的说明。留着占位就成了两条消息，正是这次要修的问题。
+        if streamer is not None:
+            await _stop_pump(streamer, pump_task)
+            pump_task = None
+            await discard(streamer.bot, streamer.sent)
+        raise
     finally:
-        if streamer is not None:
-            streamer.stop()
-        if pump_task is not None:
-            pump_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pump_task
-        if streamer is not None:
-            _CANCELS.pop(streamer.draft_id, None)
+        await _stop_pump(streamer, pump_task)
+        _GENERATIONS.pop(gid, None)
 
     METRICS.incr("ai.answer", found=bool(result.text))
     METRICS.observe("ai.tool_calls", result.tool_calls)
@@ -139,67 +180,56 @@ async def cmd_q(
         stop_reason=result.stop_reason,
     )
 
-    await _send_answer(message, result.text)
+    if streamer is None:
+        # 拿不到消息句柄（极端的 API 异常）：退化成一次性发送，功能不丢。
+        for chunk in split_text(result.text):
+            await ui_reply(
+                message, to_telegram_html(chunk), link_preview_options=_NO_PREVIEW
+            )
+        return
+
+    try:
+        await streamer.finish(result.text, reply_markup=_NO_BUTTONS)
+    except TelegramBadRequest as exc:
+        if "parse" not in str(exc).lower() and "entit" not in str(exc).lower():
+            raise
+        # 模型写出了我们没转干净的标签 —— 退成纯文本，仍然编辑同一条消息。
+        METRICS.incr("ai.html_fallback")
+        log.info("ai.html_fallback", error=str(exc)[:120])
+        await streamer.finish_plain(result.text, reply_markup=_NO_BUTTONS)
 
 
 def _compose(notice: str, body: str) -> str:
-    """草稿正文：状态提示一行 + 已生成的正文。"""
+    """占位消息正文：状态提示一行 + 已生成的正文。"""
     body = body.strip()
     if notice and body:
         return f"{notice}\n\n{body}"
     return notice or body
 
 
-def _make_streamer(message: Message) -> DraftStreamer | None:
-    """只有私聊能刷草稿。群、频道返回 None，走「等完了一次性发」。"""
-    if message.chat.type != "private" or message.bot is None:
-        return None
-    return DraftStreamer(
-        bot=message.bot,
-        chat_id=message.chat.id,
-        draft_id=new_draft_id(),
-        render=to_telegram_html,
-    )
-
-
-async def _retract(streamer: DraftStreamer | None) -> None:
-    """停止生成后把草稿清掉 —— 否则残留的 30 秒预览和「已停止」并存，很怪。"""
-    if streamer is None:
+async def _stop_pump(streamer: EditStreamer | None, task: asyncio.Task[None] | None) -> None:
+    if streamer is not None:
+        streamer.stop()
+    if task is None:
         return
-    try:
-        await streamer.bot.send_message_draft(
-            chat_id=streamer.chat_id, draft_id=streamer.draft_id, text=""
-        )
-    except Exception:   # 清理失败不影响主流程
-        log.debug("ai.draft_retract_failed")
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
-async def _send_answer(message: Message, markdown: str) -> None:
-    """发最终回答：HTML 优先，解析失败退回纯文本，超长自动分片。"""
-    chunks = split_text(markdown)
-    for chunk in chunks:
-        rich = to_telegram_html(chunk)
-        try:
-            await ui_reply(message, rich, link_preview_options=_NO_PREVIEW)
-        except TelegramBadRequest as exc:
-            if "parse" not in str(exc).lower() and "entit" not in str(exc).lower():
-                raise
-            # 模型写出了我们没转干净的标签 —— 退成纯文本，不能让用户收不到答案。
-            METRICS.incr("ai.html_fallback")
-            log.info("ai.html_fallback", error=str(exc)[:120])
-            await ui_reply(
-                message, chunk, link_preview_options=_NO_PREVIEW, parse_mode=None
-            )
-
-
-async def on_stopped(event: MessageGenerationStopped) -> None:
-    """用户点了「停止生成」。按 draft_id 找回对应的协程并叫停。"""
-    cancel = _CANCELS.get(event.draft_id)
+async def on_stop(callback: CallbackQuery) -> None:
+    """用户点了「⏹ 停止」。按 callback_data 里的 id 找回取消信号。"""
     bind(feature="ai", stopped=True)
+    gid = (callback.data or "").removeprefix("qs:")
+    cancel = _GENERATIONS.get(gid)
     if cancel is not None:
         cancel.set()
         METRICS.incr("ai.stop_requested")
+    await callback.answer("正在停止…" if cancel is not None else "已经结束了")
 
 
 def register_callbacks(router: Router) -> None:
-    router.stopped_message_generation.register(on_stopped, F)
+    router.callback_query.register(on_stop, F.data.startswith("qs:"))
+
+
+__all__ = ["cmd_q", "discard", "edit_text", "on_stop", "register_callbacks"]

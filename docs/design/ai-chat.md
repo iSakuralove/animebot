@@ -90,24 +90,52 @@ sort=rank 有 rank=0       未排名条目排在最前 → 给 max_rank 时加 r
 中文关键词必须用 UTF-8 编码的 JSON body 提交。用 `curl -d '{"keyword":"进击的巨人"}'`
 （Windows 下按 GBK 发出去）会得到 `total: 0` —— 看起来像「搜不到」，其实是编码坏了。
 
-## 流式：`sendMessageDraft`
+## 流式：占位消息 + 原地 edit
 
-Bot API 9.5 的接口，画的是**临时草稿**：30 秒后自动消失，`message_id` 是 0。
-所以生成结束后**必须**再 `sendMessage` 一次完整文本。
+**先说结论：不要用 `sendMessageDraft`。** 第一版就是用它做的，上线当天用户
+截图反馈「回了两条一样的消息」—— 草稿和最终 `sendMessage` 在客户端上**同时
+可见**，要等草稿自己 30 秒到期才消失。它本来就是「临时预览」语义，
+`message_id` 恒为 0，渲染出来的东西不是真正落库的消息。
 
-```python
-# 生成过程中（1.2s 一版，避免撞 Flood control）
-await bot.send_message_draft(chat_id=..., draft_id=..., text="…")
-# 生成结束（必须）
-await message.reply(最终全文)
+现在的做法是最朴素的那种：
+
+```
+1. 发一条占位消息「🤔 正在思考…」（带「⏹ 停止」按钮）
+2. 生成过程中按 1.4 秒节流 edit 这条消息
+3. 生成结束，把最终文本 edit 进去，摘掉按钮
+4. 超长（>3500 字符）时，第一片进占位消息，其余各发一条
 ```
 
-`draft_id` 也是「停止生成」的钥匙：带 `can_stop=True` 发出后，用户点停止，
-Telegram 推 `stopped_message_generation`（含 `draft_id`），
-`handlers.on_stopped` 按它找到取消信号。
+一条消息从头长到尾，聊天记录里始终只有一条。私聊和群里的 ephemeral 都成立
+（`bot/ui.edit_text` 按 `ephemeral_message_id` 走 `editMessageText` 或
+`editEphemeralMessageText`）。
 
-草稿发的失败（老客户端、非私聊）不是错误：`DraftStreamer` 记一次
-`ai.draft_unavailable` 就静默停止，最终消息照发。
+### 节流与 429
+
+Telegram 对同一聊天的编辑大约 1 次/秒。所以 `EditStreamer` 不在 SSE 解析循环
+里 await（那会拖慢读流），而是：
+
+- `on_text` 只记最新文本 + 置 dirty（同步，微秒级）
+- `pump()` 协程每 `interval` 秒刷一版
+- 撞 `TelegramRetryAfter` 就把间隔乘 1.6（上限 6 秒）并重试这一版
+
+### 停止按钮
+
+按钮的 `callback_data` 是 `qs:<短 id>`，`_GENERATIONS` 把 id 映射到
+`asyncio.Event`。点下去 → 置位 → `client.stream_round` 的读流循环检查到就
+抛 `Stopped` → handler 把当前半截文本留在消息里、前面加一句「已停止生成」。
+
+### 出错时不能留两条
+
+模型/网关报错时，`cmd_q` 会**先删掉占位消息**再把异常抛给 `ErrorBoundary`
+（它本来就会发一条带 trace_id 的说明）。留着占位就是又一次「两条消息」。
+
+### 为什么不用 push 式流
+
+`editMessageText` 每调一次就是一个完整往返（VPS 直连约 150ms）。按 token 刷
+（一秒几十次）会立刻撞 429，用户看到的是卡顿而不是流畅。1.4 秒的节奏是
+「看得出在长」和「不撞限流」之间的折中 —— 实测一次带工具的回答 3~8 秒，
+总共刷 3~6 版。
 
 ## 渲染：为什么自己写 Markdown → HTML
 

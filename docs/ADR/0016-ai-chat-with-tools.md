@@ -41,12 +41,14 @@
 - `sort=rank` 会把未排名条目（`rank=0`）排在最前 —— 给 `max_rank` 时强制
   加 `rank >= 1`。
 
-**流式用 `sendMessageDraft`。** Bot API 9.5 引入，是唯一能给 Telegram 做
-「逐字生成」的接口。它画的是**临时草稿**（30 秒自动消失），生成结束后必须
-再 `sendMessage` 一次完整文本。
+**流式用「占位消息 + 原地 edit」。** 先发一条「🤔 正在思考…」，生成过程中按
+1.4 秒节流 `editMessageText` 它，结束时把最终文本 edit 进去。
 
-**只在私聊流式。** `sendMessageDraft` 的 chat_id 文档写明是 private chat；
-群里的 `/q` 走 `ui.reply`（ephemeral 优先），一次性发完。
+试过 `sendMessageDraft`（Bot API 9.5），**放弃了**：它画的是临时草稿，
+会和最终 `sendMessage` 在客户端**同时可见**，要等 30 秒自己过期才消失 ——
+上线当天就被反馈「bot 回了两条一样的消息」。而且它只支持私聊。
+
+edit 方案没有这些问题：一条消息从头长到尾，私聊和群里的 ephemeral 都成立。
 
 **Markdown → Telegram HTML，不用 MarkdownV2。** MarkdownV2 要求转义 18 个
 字符，模型漏一个整条消息 400；HTML 只需转义 `& < >`，解析失败还能退回纯文本

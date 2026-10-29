@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 from aiogram import Bot, Dispatcher, Router
-from aiogram.types import Chat, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
+from animebot.bot.ui import Sent
 from animebot.config import Settings
 from animebot.core.errors import ExternalServiceError
 from animebot.features.ai import handlers as ai_handlers
@@ -26,7 +27,7 @@ from animebot.features.ai.chat import ChatEngine, _strip_foreign_keys, system_pr
 from animebot.features.ai.client import ClaudeClient, Round, iter_sse, sse_lines
 from animebot.features.ai.render import to_telegram_html
 from animebot.features.ai.session import ConversationStore
-from animebot.features.ai.stream import DraftStreamer, split_text
+from animebot.features.ai.stream import EditStreamer, split_text
 from animebot.features.ai.tools import ToolBox, parse_bing, unwrap_bing
 
 USER_ID = 8100
@@ -563,27 +564,46 @@ async def test_bangumi_token_goes_in_header(ai_settings: Settings) -> None:
     assert "Authorization" not in ToolBox(ai_settings)._bgm_headers(), "没配就不带"
 
 
-# ---------------------------------------------------------------- 草稿流
+# ---------------------------------------------------------------- 流式编辑
 
 
-class DraftRecorder:
+class EditRecorder:
+    """记录 edit_message_text / send_message，不真发请求。"""
+
     def __init__(self) -> None:
-        self.drafts: list[tuple[int, int, str]] = []
+        self.edits: list[tuple[int, str]] = []
+        self.sent: list[str] = []
+        self.fail_edit: Exception | None = None
 
-    async def send_message_draft(self, *, chat_id: int, draft_id: int, text: str) -> bool:
-        self.drafts.append((chat_id, draft_id, text))
+    async def edit_message_text(self, *, chat_id: int, message_id: int, text: str,
+                                **_kw: Any) -> bool:
+        if self.fail_edit is not None:
+            raise self.fail_edit
+        self.edits.append((message_id, text))
+        return True
+
+    async def send_message(self, *, chat_id: int, text: str, **_kw: Any) -> bool:
+        self.sent.append(text)
         return True
 
 
-async def test_draft_streamer_pushes_latest_text() -> None:
-    rec = DraftRecorder()
-    streamer = DraftStreamer(
+def make_streamer(rec: EditRecorder, **kw: Any) -> EditStreamer:
+    async def send_extra(html: str) -> None:
+        rec.sent.append(html)
+
+    return EditStreamer(
         bot=rec,  # type: ignore[arg-type]
-        chat_id=1,
-        draft_id=9,
+        sent=Sent(chat_id=1, message_id=77),
         render=lambda t: t,
-        interval=0.0,
+        send_extra=send_extra,
+        **kw,
     )
+
+
+async def test_streamer_edits_one_message_in_place() -> None:
+    """一条消息从头长到尾 —— 不能每版都发新消息（那正是「回了两遍」的来源）。"""
+    rec = EditRecorder()
+    streamer = make_streamer(rec, interval=0.0)
     streamer.on_text("评分")
     task = asyncio.create_task(streamer.pump())
     await asyncio.sleep(0.05)
@@ -594,22 +614,47 @@ async def test_draft_streamer_pushes_latest_text() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    texts = [d[2] for d in rec.drafts]
-    assert texts[0] == "评分"
-    assert "8.2" in texts[-1]
+    assert rec.sent == [], "过程中一条新消息都不该发"
+    assert [m for m, _ in rec.edits] == [77, 77], "始终编辑同一条"
+    assert "8.2" in rec.edits[-1][1]
 
 
-async def test_draft_streamer_gives_up_on_api_error() -> None:
+async def test_streamer_finish_edits_placeholder_and_sends_overflow() -> None:
+    rec = EditRecorder()
+    streamer = make_streamer(rec)
+    long_text = "a" * 4000 + "\n\n" + "b" * 4000
+    await streamer.finish(long_text)
+
+    assert rec.edits, "最终文本要写进原来那条占位消息"
+    assert len(rec.sent) == len(split_text(long_text)) - 1, "只有超出部分另起消息"
+
+
+async def test_streamer_throttle_error_does_not_kill_output() -> None:
+    from aiogram.exceptions import TelegramRetryAfter
+
+    rec = EditRecorder()
+    rec.fail_edit = TelegramRetryAfter(
+        method=None, message="flood", retry_after=0  # type: ignore[arg-type]
+    )
+    streamer = make_streamer(rec, interval=0.0)
+    streamer.on_text("x")
+    await streamer._flush()
+    assert streamer.interval > 0, "撞限流后要放慢节奏"
+    assert not streamer._broken, "限流是可恢复的，不该放弃后续输出"
+
+
+async def test_streamer_gives_up_on_bad_edit() -> None:
     from aiogram.exceptions import TelegramBadRequest
 
-    class Failing:
-        async def send_message_draft(self, **_kw: Any) -> bool:
-            raise TelegramBadRequest(method=None, message="Bad Request: not supported")  # type: ignore[arg-type]
-
-    streamer = DraftStreamer(bot=Failing(), chat_id=1, draft_id=9, render=lambda t: t)  # type: ignore[arg-type]
+    rec = EditRecorder()
+    rec.fail_edit = TelegramBadRequest(
+        method=None,  # type: ignore[arg-type]
+        message="Bad Request: message to edit not found",
+    )
+    streamer = make_streamer(rec, interval=0.0)
     streamer.on_text("x")
-    await streamer.pump()      # 不该抛
-    assert streamer.supported is False
+    await streamer._flush()
+    assert streamer._broken is True
 
 
 # ---------------------------------------------------------------- 指令装配
@@ -661,18 +706,46 @@ def dp(ai_settings: Settings) -> Dispatcher:
     return d
 
 
+class Outbox:
+    """记录发出的消息和编辑。假 answer 要返回消息对象 —— 流式靠它拿句柄编辑。"""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.edits: list[str] = []
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, list) and self.sent == other
+
+    def __iter__(self):
+        return iter(self.sent)
+
+    def __len__(self) -> int:
+        return len(self.sent)
+
+    def __getitem__(self, i):
+        return self.sent[i]
+
+
 @pytest.fixture
-def sent(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    out: list[str] = []
+def sent(monkeypatch: pytest.MonkeyPatch) -> Outbox:
+    out = Outbox()
 
-    async def fake_reply(self: Message, text: str, **_kw: Any) -> None:
-        out.append(text)
+    async def fake_reply(self: Message, text: str, **_kw: Any) -> Message:
+        out.sent.append(text)
+        return self
 
-    async def fake_answer(self: Message, text: str, **_kw: Any) -> None:
-        out.append(text)
+    async def fake_edit(self: Bot, *, chat_id: int, message_id: int, text: str,
+                        **_kw: Any) -> bool:
+        out.edits.append(text)
+        return True
+
+    async def fake_delete(self: Bot, **_kw: Any) -> bool:
+        return True
 
     monkeypatch.setattr(Message, "reply", fake_reply, raising=True)
-    monkeypatch.setattr(Message, "answer", fake_answer, raising=True)
+    monkeypatch.setattr(Message, "answer", fake_reply, raising=True)
+    monkeypatch.setattr(Bot, "edit_message_text", fake_edit, raising=True)
+    monkeypatch.setattr(Bot, "delete_message", fake_delete, raising=True)
     return out
 
 
@@ -703,11 +776,13 @@ async def test_q_reset_clears_conversation(
     assert "已开新对话" in sent[0]
 
 
-async def test_q_answers_and_sends_final_message(
-    ai_settings: Settings, fake_bot: Bot, sent: list[str], dp: Dispatcher
+async def test_q_streams_into_one_message(
+    ai_settings: Settings, fake_bot: Bot, sent: Outbox, dp: Dispatcher
 ) -> None:
+    """占位消息被编辑成答案 —— 整个过程只有一条消息，不会出现「回了两遍」。"""
     await dp.feed_update(fake_bot, msg_update("/q 评分多少"))
-    assert sent == ["8.2 分"], "最终必须有一条完整消息（草稿是临时的）"
+    assert sent.sent == ["🤔 正在思考…"], "只发一条占位消息"
+    assert sent.edits and sent.edits[-1] == "8.2 分", "答案编辑进同一条消息"
 
 
 def test_markdown_table_flattened_for_telegram() -> None:
@@ -723,3 +798,57 @@ def test_markdown_table_flattened_for_telegram() -> None:
     assert "<b>8.0</b>" in out
     assert out.count("· ") == 3
     assert "无职转生 第三季 | 8.0" in out.replace("<b>", "").replace("</b>", "")
+
+
+async def test_html_failure_edits_same_message_instead_of_resending() -> None:
+    """HTML 解析失败要退回纯文本**编辑同一条消息**，不能另发 —— 另发又是两条。"""
+    from aiogram.exceptions import TelegramBadRequest
+
+    rec = EditRecorder()
+
+    async def send_extra(html: str, **_kw: Any) -> None:
+        rec.sent.append(html)
+
+    streamer = EditStreamer(
+        bot=rec,  # type: ignore[arg-type]
+        sent=Sent(chat_id=1, message_id=77),
+        render=lambda t: f"<b>{t}",   # 故意产出非法 HTML 交给 Telegram 去拒
+        send_extra=send_extra,
+    )
+    rec.fail_edit = TelegramBadRequest(
+        method=None,  # type: ignore[arg-type]
+        message="Bad Request: can't parse entities",
+    )
+    with pytest.raises(TelegramBadRequest):
+        await streamer.finish("答案")
+    rec.fail_edit = None
+    await streamer.finish_plain("答案")
+    assert rec.edits == [(77, "答案")], "纯文本也写回同一条消息"
+
+
+async def test_stop_button_cancels_running_generation(
+    fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停止按钮的 callback_data 能找回取消信号 —— 否则点了没反应。"""
+    from animebot.features.ai import handlers as ai_handlers
+
+    answered: list[str] = []
+
+    async def fake_answer(self: CallbackQuery, text: str | None = None, **_kw: Any) -> bool:
+        answered.append(text or "")
+        return True
+
+    monkeypatch.setattr(CallbackQuery, "answer", fake_answer, raising=True)
+
+    gid, cancel = ai_handlers._new_generation()
+    cb = CallbackQuery(
+        id="cb-stop",
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        chat_instance="ci",
+        data=f"qs:{gid}",
+        message=Message(message_id=1, date=NOW,
+                        chat=Chat(id=CHAT_ID, type="private"), text="🤔 正在思考…"),
+    ).as_(fake_bot)
+    await ai_handlers.on_stop(cb)
+    assert cancel.is_set(), "取消信号必须被置位"
+    assert answered == ["正在停止…"], "点一下要立刻有反馈，否则用户以为没点上"

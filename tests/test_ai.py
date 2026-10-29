@@ -707,11 +707,12 @@ def dp(ai_settings: Settings) -> Dispatcher:
 
 
 class Outbox:
-    """记录发出的消息和编辑。假 answer 要返回消息对象 —— 流式靠它拿句柄编辑。"""
+    """记录发出的消息、编辑、草稿。"""
 
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.edits: list[str] = []
+        self.drafts: list[tuple[int, str]] = []
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, list) and self.sent == other
@@ -739,6 +740,11 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Outbox:
         out.edits.append(text)
         return True
 
+    async def fake_draft(self: Bot, *, chat_id: int, draft_id: int, text: str,
+                         **_kw: Any) -> bool:
+        out.drafts.append((draft_id, text))
+        return True
+
     async def fake_delete(self: Bot, **_kw: Any) -> bool:
         return True
 
@@ -746,6 +752,7 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Outbox:
     monkeypatch.setattr(Message, "answer", fake_reply, raising=True)
     monkeypatch.setattr(Bot, "edit_message_text", fake_edit, raising=True)
     monkeypatch.setattr(Bot, "delete_message", fake_delete, raising=True)
+    monkeypatch.setattr(Bot, "send_message_draft", fake_draft, raising=True)
     return out
 
 
@@ -776,13 +783,18 @@ async def test_q_reset_clears_conversation(
     assert "已开新对话" in sent[0]
 
 
-async def test_q_streams_into_one_message(
+async def test_private_uses_draft_then_one_final_message(
     ai_settings: Settings, fake_bot: Bot, sent: Outbox, dp: Dispatcher
 ) -> None:
-    """占位消息被编辑成答案 —— 整个过程只有一条消息，不会出现「回了两遍」。"""
+    """私聊默认走草稿流：过程中只推草稿，结束发**一条**正式消息。
+
+    草稿是临时的（30 秒消失），必须补一条正式消息；但只补一条 —— 第一次
+    上线的 bug 就是草稿和正式消息同时在，看起来像回了两遍。
+    """
     await dp.feed_update(fake_bot, msg_update("/q 评分多少"))
-    assert sent.sent == ["🤔 正在思考…"], "只发一条占位消息"
-    assert sent.edits and sent.edits[-1] == "8.2 分", "答案编辑进同一条消息"
+    assert sent.drafts, "私聊应该走草稿流（客户端会把它做成动画）"
+    assert sent.sent == ["8.2 分"], "最后只发一条正式消息"
+    assert sent.edits == [], "草稿模式不编辑消息"
 
 
 def test_markdown_table_flattened_for_telegram() -> None:
@@ -936,3 +948,64 @@ async def test_notice_yields_to_streaming_text() -> None:
     streamer.set_notice("🌐 正在联网搜索…")
     await streamer._flush()
     assert "正在联网搜索" not in rec.edits[-1][1], "正文在流时新提示不抢屏"
+
+
+async def test_group_uses_edit_not_draft(
+    ai_settings: Settings, fake_bot: Bot, sent: Outbox, dp: Dispatcher
+) -> None:
+    """草稿不支持群聊，所以群里退回占位消息 + 编辑。"""
+    update = Update(update_id=9, message=Message(
+        message_id=9, date=NOW,
+        chat=Chat(id=-1001234567890, type="supergroup"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        text="/q 评分多少",
+    ))
+    await dp.feed_update(fake_bot, update)
+    assert sent.drafts == [], "群里发不了草稿"
+    assert sent.sent and sent.sent[0] == "🤔 正在思考…", "先发占位消息"
+    assert sent.edits and sent.edits[-1] == "8.2 分", "答案编辑进同一条"
+
+
+async def test_edit_mode_setting_forces_edit_in_private(
+    ai_settings: Settings, fake_bot: Bot, sent: Outbox
+) -> None:
+    """`ai_stream_mode=edit` 时私聊也用编辑（想少一条正式消息时用）。"""
+    from aiogram import Dispatcher as _D
+    from aiogram import Router as _R
+
+    from animebot.bot.middlewares import ErrorBoundary, TraceMiddleware
+    from animebot.bot.wiring import bind_commands, collect_specs
+    from animebot.core.registry import CommandRegistry
+
+    cfg = ai_settings.model_copy(update={"ai_stream_mode": "edit"})
+    d = _D()
+    d["settings"] = cfg
+    d["engine"] = ChatEngine(cfg, FakeClient([text_round()]), FakeTools())  # type: ignore[arg-type]
+    d["conversations"] = ConversationStore()
+    reg = CommandRegistry()
+    d["registry"] = reg
+    for mw in (TraceMiddleware(reg), ErrorBoundary()):
+        d.update.outer_middleware(mw)
+    router = _R(name="ai")
+    bind_commands(router, collect_specs(ai_handlers), reg, "ai")
+    ai_handlers.register_callbacks(router)
+    d.include_router(router)
+
+    await d.feed_update(fake_bot, msg_update("/q 评分多少"))
+    assert sent.drafts == []
+    assert sent.sent[0] == "🤔 正在思考…"
+    assert sent.edits[-1] == "8.2 分"
+
+
+async def test_draft_stop_event_cancels_generation(fake_bot: Bot) -> None:
+    """草稿模式下停止按钮由 Telegram 自带，回传的更新里只有 draft_id。"""
+    from aiogram.types import Chat as _C
+    from aiogram.types import MessageGenerationStopped
+
+    gid, cancel = ai_handlers._new_generation()
+    draft_id = ai_handlers._new_draft_id(gid)
+    event = MessageGenerationStopped(
+        chat=_C(id=USER_ID, type="private"), draft_id=draft_id
+    )
+    await ai_handlers.on_generation_stopped(event)
+    assert cancel.is_set()

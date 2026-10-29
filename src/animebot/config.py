@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     ai_max_tool_rounds: int = Field(default=4, ge=0, le=8)
     # 单次请求（含所有工具轮次）的总超时。流式断了也必须给用户一个交代。
     ai_timeout: float = Field(default=120.0, gt=0)
+    # 流式落地方式：
+    #   draft —— sendMessageDraft，客户端把更新做成动画，私聊里最顺滑；
+    #            收尾必须另发一条正式消息（草稿是临时的）
+    #   edit  —— 占位消息 + 原地编辑，没有动画但只有一条消息，群里也能用
+    # 群聊不受这个开关影响（草稿不支持群，永远走 edit）。
+    ai_stream_mode: Literal["draft", "edit"] = "draft"
     # 多轮上下文：闲置多久后清空；保留多少条消息（user+assistant 各算一条）。
     ai_session_ttl: float = Field(default=1800.0, gt=0)
     ai_session_messages: int = Field(default=16, ge=2, le=64)

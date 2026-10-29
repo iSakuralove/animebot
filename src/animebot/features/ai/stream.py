@@ -1,42 +1,49 @@
-"""把生成中的回答「长」在一条消息上。
+"""把生成中的回答「长」到屏幕上。两种落地方式，按场景选。
 
-**为什么放弃了 `sendMessageDraft`。** 那个接口画的是**临时草稿**：30 秒自动
-消失、`message_id` 恒为 0、生成结束还得再 `sendMessage` 一次落库。实测在客户端
-上草稿和正式消息**同时可见**（用户截图里那两条内容相同的消息），要等草稿
-自己到期才消失 —— 看起来就是「bot 回了两遍」。而且它只支持私聊。
+## 两种方式各自解决什么问题
 
-所以改成最朴素的办法：**先发一条占位消息，然后原地 edit 它**。一条消息从头
-长到尾，聊天记录里始终只有一条，私聊和群里的 ephemeral 都适用
-（`bot.ui.edit_text` 负责这两条 API 的分叉）。
+**`sendMessageDraft`（草稿流）—— 私聊默认。**
+它的更新是**客户端动画过渡**的（同一个 `draft_id` 连发，客户端把文本平滑推移），
+所以哪怕 1.7 版/秒，看起来也是顺滑地在打字。代价：
 
-## 为什么要自己控制「显示进度」
+- 草稿是临时的（30 秒到期），`message_id` 恒为 0，结束必须再发一条正式消息；
+- 只支持**私聊**，群里没法用；
+- 没有 `reply_markup`，做不了自定义按钮 —— 但 `can_stop=True` 会由 Telegram
+  自带一个「停止生成」按钮，比自己做还自然。
+
+**`editMessageText`（原地编辑）—— 群聊 / 草稿不可用时。**
+先发一条占位消息再反复改。没有动画，只有硬替换，而 `editMessageText` 一次
+约 340ms 往返，最多 3 版/秒 —— 看得出是一跳一跳的。它换来的是「只有一条消息」
+和群里可用的 ephemeral 支持。
+
+## 两条路共用的部分：回放
 
 实测网关的吐字节奏（2026-10-29，deepseek-v4.1-flash）：
 
-| 阶段 | 耗时 | 说明 |
+| 阶段 | 耗时 | 产出 |
 |---|---|---|
-| 思考（强制 thinking，关不掉） | 1~3s | 一个正文 token 都没有 |
-| 工具调用 | 0.3~4s | Bangumi / Bing 往返 |
-| 正文 | **0.7s 出 130 个 delta** | 一次性涌进来 |
+| 思考（强制 thinking，关不掉） | 1~3s | 零个正文 token |
+| 工具调用 | 0.3~4s | 零个正文 token |
+| 正文 | **0.7s 出 130 个 delta** | 一整段，一次性涌进来 |
 
-正文只有一个「突发」，不是稳定细流。直接把最新文本刷上去的话，用户在
-0.7 秒里看不到任何中间态 —— 观感就是「没有流式」。所以这里加了一层**回放**：
-每次 tick 只把接收缓冲区往前推一段（约剩余量的 35%，最少 24 字），
-450 字的回答大约 2 秒长完。这不是造假，是把「已经拿到的内容」按人能读的
-节奏放出来；`finish()` 仍然一次写完整文本，不做任何截断。
+正文只有一个「突发」。直接刷最新文本的话，用户在 0.7 秒里看不到任何中间态。
+所以两种方式都走同一层回放：`on_text` 收到完整正文进缓冲区，每次 tick 只把
+**显示进度**往前推一段。回放的全是已经拿到的真实内容，`finish()` 一次写完整
+文本，不会因为「还没播完」而截断。
 
-## 节流
+## 草稿和正式消息不能并存
 
-一手实测：同一条消息连刷 0.2s 一版 10/10 全过、不报 429（编辑不像
-`sendMessage` 那样每次都推通知）。0.25s 是「看得出在长」和「别浪费往返」的
-折中。撞 429 就把间隔乘 1.6（上限 6s），重试这一版，不做重试风暴。
+`sendMessageDraft` 的残留问题是这次改动的起因：草稿和正式消息同时在聊天里
+显示，看起来像 bot 回了两遍。文档说「bot 发消息时草稿会消失」，实测只有
+**在草稿请求都落地之后**发消息才成立 —— 所以 `settle()` 会在收尾前等一个
+往返，把可能在途的草稿消化掉。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -46,15 +53,21 @@ from ...observability.logging import get_logger
 
 log = get_logger("animebot.ai.stream")
 
-#: 两次编辑之间的间隔（按「上一次发出」起算，含网络往返）。
-_MIN_INTERVAL = 0.25
+#: 两次更新之间的间隔（按「上一次发出」起算，含网络往返）。
+#: 草稿实测 0.25s 稳、0.20s 开始撞 429；编辑实测 0.2s 连刷 10 版全过。
+#: 两者的真实上限都是 RTT（VPS 到 Telegram 约 340ms），所以这个值只是下限。
+_DRAFT_INTERVAL = 0.3
+_EDIT_INTERVAL = 0.25
 _MAX_INTERVAL = 6.0
 #: 单条消息的字符预算。Telegram 上限 4096，HTML 实体还会再涨一些。
 _MESSAGE_CAP = 3500
-#: 每次 tick 至少推进这么多字。太小会让短回答磨很久，太大就回到「一次蹦完」。
-_REVEAL_MIN = 24
-#: 每次 tick 推进剩余量的比例。0.35 让 450 字大约 2 秒长完。
-_REVEAL_RATIO = 0.35
+#: 每次 tick 至少推进这么多字。
+_REVEAL_MIN = 12
+#: 每次 tick 推进剩余量的比例。越小越平滑、越长。
+_DRAFT_REVEAL = 0.22      # 草稿有动画，可以慢一点，更像在打字
+_EDIT_REVEAL = 0.35       # 编辑没有动画，太慢会显得卡住
+#: 收尾前等一个往返，让在途的草稿落地（否则它会和正式消息并存）。
+_SETTLE = 0.5
 
 #: 续篇发送器：收到（可带 parse_mode=None 的）文本，发出去。由 handler 提供，
 #: 群里走 ephemeral。超长回答和 HTML 降级都靠它补后续分片。
@@ -62,37 +75,62 @@ SendExtra = Callable[..., Awaitable[object]]
 
 
 def compose(notice: str, body: str) -> str:
-    """占位消息正文：状态提示一行 + 已生成的部分。"""
+    """消息正文：状态提示一行 + 已生成的部分。"""
     body = body.strip()
     if notice and body:
         return f"{notice}\n\n{body}"
     return notice or body
 
 
-@dataclass(slots=True)
-class EditStreamer:
-    """占位消息 + 节流原地编辑 + 正文回放。
+def split_text(text: str, limit: int = _MESSAGE_CAP) -> list[str]:
+    """按段落边界切分，尽量不把一句话劈开。空输入返回一个占位串。"""
+    text = text.strip()
+    if not text:
+        return ["（模型没有返回内容）"]
+    out: list[str] = []
+    rest = text
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = window.rfind("\n\n")
+        if cut < limit // 2:
+            cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = limit
+        out.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        out.append(rest)
+    return out
 
-    `on_text` 是同步回调（在解析 SSE 的循环里调），只记文本并置 dirty；
-    真正的网络请求和回放节奏由 `pump` 协程控制 —— 在解析循环里 await 会拖慢读流。
+
+class _Pacer:
+    """回放 + 节流的公共部分。子类只实现 `_push`。
+
+    不用 dataclass：子类要加必填字段，而基类字段都有默认值，继承会把
+    「非默认参数跟在默认参数后面」变成硬错误。
     """
 
-    bot: Bot
-    sent: Sent
-    render: Callable[[str], str]
-    send_extra: SendExtra
-    interval: float = _MIN_INTERVAL
-    _notice: str = ""
-    _body: str = ""
-    _revealed: int = 0
-    _shown: str = ""
-    _dirty: asyncio.Event = field(default_factory=asyncio.Event)
-    _stopping: bool = False
-    _broken: bool = False
+    def __init__(
+        self,
+        *,
+        render: Callable[[str], str],
+        interval: float,
+        reveal_ratio: float,
+    ) -> None:
+        self.render = render
+        self.interval = interval
+        self.reveal_ratio = reveal_ratio
+        self._notice = ""
+        self._body = ""
+        self._revealed = 0
+        self._shown = ""
+        self._dirty = asyncio.Event()
+        self._stopping = False
+        self._broken = False
 
     # ---------------------------------------------------------- 输入
     def on_text(self, body: str) -> None:
-        """收到「到目前为止的完整正文」。回放进度不倒退，除非正文变短了。
+        """收到「到目前为止的完整正文」。
 
         正文一出现就撤掉状态行：它只是「现在在干什么」的进度提示，真内容来了
         就没有意义了。留着会在收尾时突然消失，看起来像消息跳了一下。
@@ -115,10 +153,10 @@ class EditStreamer:
 
     # ---------------------------------------------------------- 泵
     async def pump(self) -> None:
-        """有变化就按节流编辑一版。被 cancel 时静默退出。
+        """有变化就按节流推一版。被 cancel 时静默退出。
 
-        节流按「两次**发出**之间的间隔」算：`_flush` 本身要一个网络往返
-        （VPS 直连约 150ms），把它算进间隔才能保证节奏稳定。
+        节流按「两次**发出**之间的间隔」算：`_push` 本身要一个网络往返，
+        把它算进间隔才能保证节奏稳定。
         """
         loop = asyncio.get_running_loop()
         try:
@@ -129,8 +167,7 @@ class EditStreamer:
                     return
                 started = loop.time()
                 await self._flush()
-                # 回放还没追上接收缓冲区：这一版不是终点，继续排下一版。
-                # 少了这一步，正文会在第一版之后就停住，等下一次真实 delta 才动。
+                # 回放还没追上缓冲区：这一版不是终点，继续排下一版。
                 if self._revealed < len(self._body) and not self._broken:
                     self._dirty.set()
                 await asyncio.sleep(max(0.0, self.interval - (loop.time() - started)))
@@ -147,11 +184,12 @@ class EditStreamer:
         if not text or text == self._shown:
             return
         try:
-            await edit_text(self.bot, self.sent, text)
+            await self._push(text)
             self._shown = text
         except TelegramRetryAfter as exc:
             # 撞限流：放慢节奏，这一版稍后重试。可恢复，不算故障。
-            self.interval = min(max(self.interval * 1.6, _MIN_INTERVAL), _MAX_INTERVAL)
+            self.interval = max(self.interval, _DRAFT_INTERVAL) * 1.6
+            self.interval = min(self.interval, _MAX_INTERVAL)
             log.info("ai.stream_throttled", retry_after=exc.retry_after,
                      interval=round(self.interval, 1))
             await asyncio.sleep(min(exc.retry_after, 5))
@@ -160,7 +198,10 @@ class EditStreamer:
             if "not modified" in str(exc).lower():
                 return
             self._broken = True
-            log.info("ai.stream_edit_failed", error=str(exc)[:120])
+            log.info("ai.stream_push_failed", error=str(exc)[:120])
+
+    async def _push(self, text: str) -> None:  # pragma: no cover - 子类实现
+        raise NotImplementedError
 
     def _advance(self) -> None:
         """把回放进度往前推一段。收尾阶段（`_stopping`）直接到头。"""
@@ -170,7 +211,7 @@ class EditStreamer:
         if self._stopping:
             self._revealed = len(self._body)
             return
-        step = max(_REVEAL_MIN, int(remaining * _REVEAL_RATIO + 0.999))
+        step = max(_REVEAL_MIN, int(remaining * self.reveal_ratio + 0.999))
         self._revealed = min(len(self._body), self._revealed + step)
 
     @property
@@ -182,10 +223,71 @@ class EditStreamer:
         """当前已经在屏幕上显示的内容。用户按停止时用来保留半截答案。"""
         return self._visible
 
-    # ---------------------------------------------------------- 收尾
     def stop(self) -> None:
         self._stopping = True
         self._dirty.set()
+
+
+class DraftStreamer(_Pacer):
+    """草稿流：客户端把同一 `draft_id` 的更新做成动画。只有私聊能用。
+
+    `can_stop=True` 时 Telegram 自带「停止生成」按钮，按下会推
+    `stopped_message_generation`（带 draft_id），handler 据此叫停。
+    """
+
+    def __init__(
+        self,
+        *,
+        bot: Bot,
+        chat_id: int,
+        draft_id: int,
+        render: Callable[[str], str],
+        interval: float = _DRAFT_INTERVAL,
+    ) -> None:
+        super().__init__(render=render, interval=interval, reveal_ratio=_DRAFT_REVEAL)
+        self.bot = bot
+        self.chat_id = chat_id
+        self.draft_id = draft_id
+
+    async def _push(self, text: str) -> None:
+        await self.bot.send_message_draft(
+            chat_id=self.chat_id, draft_id=self.draft_id, text=text, can_stop=True
+        )
+
+    async def settle(self) -> None:
+        """收尾前把手里的内容推完，再等一个往返。
+
+        草稿和正式消息不能并存：文档说「bot 发消息时草稿消失」，但那只在草稿
+        请求全部落地之后才成立。第一版正是漏了这一步，用户看到「回了两条」。
+
+        先 `_flush` 一次是因为 pump 可能还没跑过（引擎很快，或者刚创建就被叫停）——
+        不推的话草稿一版都没出现，用户只看到最后那条正式消息。
+        """
+        self.stop()
+        with contextlib.suppress(TelegramBadRequest, TelegramRetryAfter):
+            await self._flush()
+        await asyncio.sleep(_SETTLE)
+
+
+class EditStreamer(_Pacer):
+    """原地编辑：一条占位消息从头长到尾。群聊 / 草稿不可用时用。"""
+
+    def __init__(
+        self,
+        *,
+        bot: Bot,
+        sent: Sent,
+        render: Callable[[str], str],
+        send_extra: SendExtra,
+        interval: float = _EDIT_INTERVAL,
+    ) -> None:
+        super().__init__(render=render, interval=interval, reveal_ratio=_EDIT_REVEAL)
+        self.bot = bot
+        self.sent = sent
+        self.send_extra = send_extra
+
+    async def _push(self, text: str) -> None:
+        await edit_text(self.bot, self.sent, text)
 
     async def finish(self, markdown: str, **kw: object) -> None:
         """把最终回答写进占位消息；超长时其余分片另起消息。
@@ -219,24 +321,3 @@ class EditStreamer:
                 raise
         for chunk in rest:
             await self.send_extra(chunk, parse_mode=None)
-
-
-def split_text(text: str, limit: int = _MESSAGE_CAP) -> list[str]:
-    """按段落边界切分，尽量不把一句话劈开。空输入返回一个占位串。"""
-    text = text.strip()
-    if not text:
-        return ["（模型没有返回内容）"]
-    out: list[str] = []
-    rest = text
-    while len(rest) > limit:
-        window = rest[:limit]
-        cut = window.rfind("\n\n")
-        if cut < limit // 2:
-            cut = window.rfind("\n")
-        if cut < limit // 2:
-            cut = limit
-        out.append(rest[:cut].rstrip())
-        rest = rest[cut:].lstrip("\n")
-    if rest:
-        out.append(rest)
-    return out

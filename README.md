@@ -188,7 +188,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-472 个测试。四个是回归红线：
+475 个测试。四个是回归红线：
 
 - [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实动漫帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。

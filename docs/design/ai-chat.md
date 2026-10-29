@@ -123,6 +123,10 @@ Telegram 推 `stopped_message_generation`（含 `draft_id`），
 顺序反了两种都错：先转义再插标签会把 `<b>` 自己转义；先插标签再转义会把
 `&amp;` 里的 `**` 找出来。
 
+**表格会被压平。** Telegram 不渲染 markdown 表格，原样发出去就是一堆竖线。
+系统提示里要求模型别写表格，但模型不一定听 —— `flatten_tables` 兜一层，把
+`| a | b |` 变成「· a | b」。
+
 **链接只保留 `http(s)` / `tg`**。模型可能编出 `javascript:`，放进 `<a href>`
 就是可点击的坑 —— 不安全的协议退成「文字（url）」纯文本。
 

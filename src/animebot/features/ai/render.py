@@ -28,6 +28,8 @@ _HEADING = re.compile(r"^(#{1,6})\s+(.*)$", re.M)
 _BULLET = re.compile(r"^[ \t]*[-*+]\s+", re.M)
 _QUOTE = re.compile(r"^>\s?", re.M)
 _HR = re.compile(r"^\s*(?:---+|\*\*\*+|___+)\s*$", re.M)
+_TABLE_ROW = re.compile(r"^\s*\|(.+)\|\s*$", re.M)
+_TABLE_SEP = re.compile(r"^\s*\|[\s:|-]+\|\s*$", re.M)
 
 
 def _escape(text: str) -> str:
@@ -40,6 +42,30 @@ def _link(match: re.Match[str]) -> str:
     if not _SAFE_SCHEME.match(url):
         return f"{label}（{url}）"     # 不安全/相对链接退成纯文本，不生成 <a>
     return f'<a href="{html.escape(url, quote=True)}">{label}</a>'
+
+
+def flatten_tables(text: str) -> str:
+    """把 markdown 表格压成「· a | b | c」的行。
+
+    Telegram 不渲染表格 —— 原样发出去就是一堆竖线。系统提示里已经要求模型
+    别写表格，但模型不一定听，所以这里兜一层。
+
+    对齐分隔行（`|---|:--:|`）直接丢掉；其余每行取单元格、去掉首尾空白。
+    """
+    lines = text.splitlines()
+    out: list[str] = []
+    for line in lines:
+        if _TABLE_SEP.match(line):
+            continue
+        row = _TABLE_ROW.match(line)
+        if row:
+            cells = [cell.strip() for cell in row.group(1).split("|")]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                out.append("· " + " | ".join(cells))
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def to_telegram_html(markdown: str) -> str:
@@ -61,7 +87,7 @@ def to_telegram_html(markdown: str) -> str:
         body = _escape(match.group(2).strip("\n"))
         return stash(f"<pre>{body}</pre>")
 
-    text = _CODE_FENCE.sub(code_block, markdown)
+    text = _CODE_FENCE.sub(code_block, flatten_tables(markdown))
 
     def inline_code(match: re.Match[str]) -> str:
         return stash(f"<code>{_escape(match.group(1))}</code>")

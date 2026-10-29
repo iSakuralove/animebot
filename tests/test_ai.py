@@ -708,3 +708,18 @@ async def test_q_answers_and_sends_final_message(
 ) -> None:
     await dp.feed_update(fake_bot, msg_update("/q 评分多少"))
     assert sent == ["8.2 分"], "最终必须有一条完整消息（草稿是临时的）"
+
+
+def test_markdown_table_flattened_for_telegram() -> None:
+    """Telegram 不渲染表格。原样发出去就是一堆竖线，所以先压成列表行。"""
+    md = (
+        "| 作品 | 评分 |\n"
+        "|---|---|\n"
+        "| 无职转生 第三季 | **8.0** |\n"
+        "| 芙莉莲 第二季 | 7.5 |\n"
+    )
+    out = to_telegram_html(md)
+    assert "|---|" not in out
+    assert "<b>8.0</b>" in out
+    assert out.count("· ") == 3
+    assert "无职转生 第三季 | 8.0" in out.replace("<b>", "").replace("</b>", "")

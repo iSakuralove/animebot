@@ -20,6 +20,8 @@ uv run python -m animebot run
 | `manga.ready` | 漫画模块就绪，报告漫画频道的帖子 / 文件数 |
 | `manga.empty` | **漫画频道还没回填**，`/c` 什么都搜不到 |
 | `app.ready` | 数据库连上，按频道报告帖子数和文件数 `posts={anime:…, manga:…}` |
+| `ai.ready` | `/q` 可用，报告主模型 / 兜底模型 / 工具列表 |
+| `ai.not_configured` | **`ANIMEBOT_AI_API_KEY` 为空**，`/q` 会回「还没配好」 |
 | `bot.commands_synced` | 指令菜单已推给 Telegram |
 | `bot.start` | 拿到 `getMe`，token 有效 |
 | `bot.proxy` | 走了代理（`ANIMEBOT_PROXY` 非空时）|
@@ -267,6 +269,17 @@ uv run python -m animebot syncstat
 - `最近收到` 在动但 `最近入库` 不动 → 频道最近只发了公告，没发番剧帖。正常。
 
 只看第二个数字的话，「一个月没发新番」和「同步彻底挂了」长得一模一样。
+
+### `/q` 报「暂时用不了」或答「没查到」
+
+按这个顺序：
+
+1. `/health` —— `ai` 那一行是 🟢 还是 🔴（`status=unconfigured` 说明 key 没配）
+2. `journalctl -u animebot | grep ai\.` —— 看是 `ai.http_error`（网关/额度）
+   还是 `ai.tool_failed`（工具挂了，模型会照常回答但只能凭记忆）
+3. `ai.tool{tool=web_search,outcome=error}` 一直涨 → Bing 改版或返回验证页，
+   `web_search` 的 HTML 解析要跟着改
+4. `ai.fallback` 出现 → 主模型（deepseek）在报错，已自动切到 glm
 
 ### 搜不到新发的帖子
 

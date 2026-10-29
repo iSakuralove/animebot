@@ -45,3 +45,4 @@
 | [0013](0013-multi-channel-one-library.md) | 漫画频道接入：频道是数据，一个库、channel_id 当作用域 | 已采纳 |
 | [0014](0014-access-log-one-line-per-request.md) | 每次交互一条 INFO 访问日志；polling 瞬时错误降级 | 已采纳 |
 | [0015](0015-group-search-ephemeral.md) | 群聊检索：@bot / 回复触发，结果走私密回复 | 已采纳 |
+| [0016](0016-ai-chat-with-tools.md) | `/q` AI 对话：Claude 协议 + 自带工具 + 草稿流式 | 已采纳 |

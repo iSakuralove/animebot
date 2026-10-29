@@ -48,6 +48,7 @@ uv run animebot run
 | 私聊直接发字 | 搜动漫。标题命中优先，打错字会纠错 |
 | `/s <关键词>` | 搜动漫，严谨模式：标题精确匹配，不猜错字 |
 | `/c <关键词>` | **搜漫画频道**。中文名 / 别名 / 日文原名、`#标签`、打错字给「名字相近」；不带词给热门标签按钮 |
+| `/q <问题>` | **问 AI**。会自己查 Bangumi / 联网 / 翻频道索引，私聊里逐字流式输出 |
 | `@bot <关键词>` | 群里搜动漫（等同私聊纯文本）。不带关键词列出可用指令 |
 | 回复 bot 的消息 <关键词> | 群里搜动漫；接「@bot 看用法 → 直接回关键词」这条路径 |
 | `/check <番名>` | 只回答发过 / 没发过（管理员） |
@@ -102,7 +103,8 @@ src/animebot/
 ├── features/            功能模块，加模块不改其它文件
 │   ├── system/          /help /ping /health /metrics /syncstat /trace
 │   ├── search/          动漫：私聊纯文本 /s /check /tags
-│   └── manga/           漫画：/c（落地页标签按钮、结果翻页）
+│   ├── manga/           漫画：/c（落地页标签按钮、结果翻页）
+│   └── ai/              /q AI 对话（Claude 协议 + 工具 + 草稿流式）
 ├── domain/              Post / ChannelFile 模型 + 字段别名表 + 链接分类
 ├── parsing/             帖子 / 文件消息解析（不依赖 aiogram）
 ├── storage/             SQLite 仓储
@@ -119,6 +121,12 @@ src/animebot/
 **两条数据入口共用同一个解析器。** 增量同步先把 aiogram `Message` 转成导出
 JSON 的形状，再喂给和回填完全相同的 `parse_message`。两份解析代码必然漂移
 —— 回填修的 bug 增量里还在，而黄金回归测试只覆盖回填那条路。
+
+**AI 对话用 Claude 协议 + 自己做工具循环。** 网关把服务端工具静默丢弃，
+所以 Bangumi、网页搜索、频道检索三个工具都得我们实现再回灌 —— 好处是
+「频道里发过没」这种问题模型真的能答。流式靠 `sendMessageDraft`，它是**临时
+草稿**（30 秒消失），所以结束时必须再发一次完整消息。见
+[ADR-0016](docs/ADR/0016-ai-chat-with-tools.md)。
 
 **不用 FTS5。** 实测 trigram tokenizer 对中文 2 字查询全部未命中（要求至少
 3 字符），而 LIKE 全表扫 1639 行只要 0.5~3ms、rapidfuzz 模糊排序 10ms。
@@ -178,7 +186,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-423 个测试。四个是回归红线：
+454 个测试。四个是回归红线：
 
 - [test_parser_golden.py](tests/test_parser_golden.py) —— 1639 个真实动漫帖子当
   黄金数据集，`failed` 必须永远是 0，每个字段的填充数不许下降。

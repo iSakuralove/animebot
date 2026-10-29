@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LinkMode = Literal["public", "internal"]
 
 # 默认启用的功能模块。加新模块 = 往这里加一个名字 + 建一个包，不动别的文件。
-DEFAULT_FEATURES = ("system", "search", "manga")
+DEFAULT_FEATURES = ("system", "search", "manga", "ai")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +114,27 @@ class Settings(BaseSettings):
     http_timeout: float = Field(default=10.0, gt=0)
     http_retries: int = Field(default=2, ge=0, le=5)
     http_cache_ttl: int = Field(default=900, ge=0)
+
+    # ---- AI 对话（/q）----
+    # 走 Anthropic Messages 协议（/v1/messages + SSE）。这个网关是 OpenAI 兼容的
+    # 再包一层 Claude 协议，所以请求体按 Claude 写、模型名填它自己的。
+    ai_base_url: str = "https://happycoding.xyz"
+    ai_api_key: SecretStr = SecretStr("")
+    # 首选 + 兜底。主模型 5xx/超时会退到下一个 —— 一个网关挂掉不该让 /q 整个不可用。
+    ai_model: str = "deepseek-v4.1-flash"
+    ai_fallback_model: str = "glm-5.3-flash"
+    # 单次回答上限。这家的模型强制 thinking，思考也算 token —— 2000 是
+    # 「能写完一篇解释」和「别把余额烧穿」之间的折中。
+    ai_max_tokens: int = Field(default=2000, ge=256, le=8000)
+    # 工具循环上限。模型不会自己停，超了就在这一轮强制它总结。
+    ai_max_tool_rounds: int = Field(default=4, ge=0, le=8)
+    # 单次请求（含所有工具轮次）的总超时。流式断了也必须给用户一个交代。
+    ai_timeout: float = Field(default=120.0, gt=0)
+    # 多轮上下文：闲置多久后清空；保留多少条消息（user+assistant 各算一条）。
+    ai_session_ttl: float = Field(default=1800.0, gt=0)
+    ai_session_messages: int = Field(default=16, ge=2, le=64)
+    # 联网搜索走 Bing（VPS 直连可用，DDG 会返回人机验证页）。
+    ai_search_timeout: float = Field(default=15.0, gt=0)
 
     # ---- 可观测性 ----
     log_level: str = "INFO"

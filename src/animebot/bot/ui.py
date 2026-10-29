@@ -45,21 +45,26 @@ class Sent:
         )
 
 
-async def reply(message: Message, text: str, **kw: Any) -> Sent | None:
-    """回复一条消息，返回句柄。群聊里优先 ephemeral —— 只有发送者自己看得到。
+async def reply(
+    message: Message, text: str, *, public: bool = False, **kw: Any
+) -> Sent | None:
+    """回复一条消息，返回句柄。群聊里默认走 ephemeral —— 只有发送者自己看得到。
 
-    两种情况直接交给 `Message.reply`：私聊、以及入站本身就是 ephemeral 消息
-    （`ephemeral_message_id` 有值时 aiogram 会自动补 ephemeral 参数）。只有
-    「群里的普通消息」（@bot 提及、手打的 `/s@bot`）需要显式指定接收者。
+    三种情况直接交给 `Message.reply`：私聊、入站本身就是 ephemeral 消息
+    （`ephemeral_message_id` 有值时 aiogram 会自动补 ephemeral 参数）、以及
+    调用方显式要 `public=True`。
 
     群里的普通消息能不能私密回复，取决于 bot 在群里是不是管理员：是管理员随时
     可发，否则只能在收到触发动作后 15 秒内发、且必须带上触发动作的 id。这里
     没有触发动作，所以非管理员会失败 —— 失败就退回公开回复，功能降级而不报错。
+
+    `public=True` 是给 `/q` 这类「答案是全群的信息」用的：用户明确要求都看得见，
+    就不该藏起来。搜索结果相反 —— 那是某个人在找东西，公开等于替他刷屏。
     """
 
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return _sent(await message.reply(text, **kw))
-    if message.ephemeral_message_id is not None or message.from_user is None:
+    if public or message.ephemeral_message_id is not None or message.from_user is None:
         return _sent(await message.reply(text, **kw))
 
     ephemeral = EphemeralMessageParameters(receiver_user_id=message.from_user.id)

@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import html as html_module
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -717,6 +719,7 @@ class Outbox:
         self.sent: list[str] = []
         self.edits: list[str] = []
         self.drafts: list[tuple[int, str]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, list) and self.sent == other
@@ -735,8 +738,9 @@ class Outbox:
 def sent(monkeypatch: pytest.MonkeyPatch) -> Outbox:
     out = Outbox()
 
-    async def fake_reply(self: Message, text: str, **_kw: Any) -> Message:
+    async def fake_reply(self: Message, text: str, **kw: Any) -> Message:
         out.sent.append(text)
+        out.calls.append((text, kw))
         return self
 
     async def fake_edit(self: Bot, *, chat_id: int, message_id: int, text: str,
@@ -856,7 +860,7 @@ async def test_stop_button_cancels_running_generation(
 
     monkeypatch.setattr(CallbackQuery, "answer", fake_answer, raising=True)
 
-    gid, cancel = ai_handlers._new_generation()
+    gid, gen = ai_handlers._new_generation(requester_id=USER_ID)
     cb = CallbackQuery(
         id="cb-stop",
         from_user=User(id=USER_ID, is_bot=False, first_name="T"),
@@ -866,7 +870,7 @@ async def test_stop_button_cancels_running_generation(
                         chat=Chat(id=CHAT_ID, type="private"), text="🤔 正在思考…"),
     ).as_(fake_bot)
     await ai_handlers.on_stop(cb)
-    assert cancel.is_set(), "取消信号必须被置位"
+    assert gen.cancel.is_set(), "取消信号必须被置位"
     assert answered == ["正在停止…"], "点一下要立刻有反馈，否则用户以为没点上"
 
 
@@ -1013,6 +1017,59 @@ async def test_group_uses_edit_not_draft(
     assert sent.edits and sent.edits[-1] == "8.2 分", "答案编辑进同一条"
 
 
+async def test_group_answer_is_public_not_ephemeral(
+    ai_settings: Settings, fake_bot: Bot, sent: Outbox, dp: Dispatcher
+) -> None:
+    """群里的 /q 要全群可见 —— 这是公共信息，藏起来没道理。
+
+    搜索结果相反（ephemeral）：那是某个人在找东西，公开等于替他刷屏。
+    所以两个入口在 ui.reply 上走不同分支，这里钉住 /q 这一侧。
+    """
+    update = Update(update_id=11, message=Message(
+        message_id=11, date=NOW,
+        chat=Chat(id=-1001234567890, type="supergroup"),
+        from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        text="/q 评分多少",
+    ))
+    await dp.feed_update(fake_bot, update)
+    assert sent.sent, "必须有回复"
+    for text, kw in sent.calls:
+        assert "ephemeral_message_parameters" not in kw, f"不该走私密：{text[:20]}"
+
+
+async def test_stop_button_ignores_bystanders(
+    ai_settings: Settings, fake_bot: Bot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """公开回答时停止按钮全群可见。别人点了不能停掉别人的提问。"""
+    answers: list[tuple[str, bool]] = []
+
+    async def fake_answer(self: CallbackQuery, text: str | None = None, **kw: Any) -> bool:
+        answers.append((text or "", bool(kw.get("show_alert"))))
+        return True
+
+    monkeypatch.setattr(CallbackQuery, "answer", fake_answer, raising=True)
+
+    gid, gen = ai_handlers._new_generation(requester_id=USER_ID, public=True)
+    other = CallbackQuery(
+        id="cb-x", from_user=User(id=999, is_bot=False, first_name="Other"),
+        chat_instance="ci", data=f"qs:{gid}",
+        message=Message(message_id=1, date=NOW,
+                        chat=Chat(id=-1001234567890, type="supergroup"), text="…"),
+    ).as_(fake_bot)
+    await ai_handlers.on_stop(other)
+    assert gen.cancel.is_set() is False, "旁观者不能停"
+    assert answers and answers[0][1] is True, "要给个明确的提示，不是静默"
+
+    owner = CallbackQuery(
+        id="cb-o", from_user=User(id=USER_ID, is_bot=False, first_name="T"),
+        chat_instance="ci", data=f"qs:{gid}",
+        message=Message(message_id=1, date=NOW,
+                        chat=Chat(id=-1001234567890, type="supergroup"), text="…"),
+    ).as_(fake_bot)
+    await ai_handlers.on_stop(owner)
+    assert gen.cancel.is_set() is True, "提问者能停"
+
+
 async def test_edit_mode_setting_forces_edit_in_private(
     ai_settings: Settings, fake_bot: Bot, sent: Outbox
 ) -> None:
@@ -1049,10 +1106,77 @@ async def test_draft_stop_event_cancels_generation(fake_bot: Bot) -> None:
     from aiogram.types import Chat as _C
     from aiogram.types import MessageGenerationStopped
 
-    gid, cancel = ai_handlers._new_generation()
+    gid, gen = ai_handlers._new_generation(requester_id=USER_ID)
     draft_id = ai_handlers._new_draft_id(gid)
     event = MessageGenerationStopped(
         chat=_C(id=USER_ID, type="private"), draft_id=draft_id
     )
     await ai_handlers.on_generation_stopped(event)
-    assert cancel.is_set()
+    assert gen.cancel.is_set()
+
+
+# ---------------------------------------------------------------- 长度上限
+
+
+def test_long_answer_is_split_under_telegram_limit() -> None:
+    """Telegram 文本上限是 4096 字符（**解析后**的字符数），1024 只约束图片说明。
+
+    实测（2026-10-29）：4096 字 OK，4097 字 `MESSAGE_TOO_LONG`；`&amp;` 堆到
+    20KB 原始长度但解析后 4096 字，照样 OK。所以切分按**可见字符**算，3500 留余量。
+    """
+    chunks = split_text("字" * 12000, limit=3500)
+    assert len(chunks) == 4
+    assert all(len(c) <= 3500 for c in chunks)
+    assert "".join(chunks) == "字" * 12000
+
+
+def _visible_len(html: str) -> int:
+    """Telegram 数的是解析后的可见字符 —— 标签和转义都不占额度。"""
+    return len(html_module.unescape(re.sub(r"<[^>]+>", "", html)))
+
+
+_NL = chr(10)
+_RENDER_CASES = [
+    "**粗** & `code`" + _NL + "- 列表 [链接](https://a.example)",
+    "## 标题" + _NL + "> 引用" + _NL + "1. 第一" + _NL + "- 第二",
+    "普通一句话，没有任何 markdown。",
+    "```python" + _NL + "print('x')" + _NL + "```",
+]
+
+
+@pytest.mark.parametrize("md", _RENDER_CASES)
+def test_rendered_length_never_exceeds_raw_length(md: str) -> None:
+    """切分按 markdown 原文算就够 —— 渲染后的**可见长度**只减不增。
+
+    转义会把 `&` 撑成 `&amp;`（原始变长），但 Telegram 数的是解析后的字符。
+    """
+    from animebot.features.ai.render import to_telegram_html
+
+    assert _visible_len(to_telegram_html(md)) <= len(md)
+
+
+
+async def test_streaming_never_sends_over_limit(
+    ai_settings: Settings, fake_bot: Bot, sent: Outbox, dp: Dispatcher
+) -> None:
+    """流式中间帧也要守 4096 —— 超了 Telegram 直接拒，用户看到的是报错。"""
+    long_text = "字" * 9000
+
+    class LongClient(FakeClient):
+        async def stream_round(self, messages, *, tools=None, system=None,
+                               on_text=None, on_thinking=None, cancel=None, model=None):
+            round_ = text_round(long_text)
+            if on_text is not None:
+                on_text(long_text)
+            return round_
+
+    dp["engine"] = ChatEngine(  # type: ignore[call-arg]
+        ai_settings, LongClient([]), FakeTools()
+    )
+    await dp.feed_update(fake_bot, msg_update("/q 长答案"))
+
+    everything = sent.sent + sent.edits
+    assert everything, "应该有输出"
+    for text in everything:
+        assert len(text) <= 4096, f"超过 Telegram 上限：{len(text)}"
+    assert len(sent.sent) >= 3, "9000 字必须切成多条"

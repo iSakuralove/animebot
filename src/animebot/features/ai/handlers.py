@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import itertools
 import secrets
+from dataclasses import dataclass
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -53,19 +54,29 @@ _NO_BUTTONS = InlineKeyboardMarkup(inline_keyboard=[])
 _RESET_WORDS = frozenset({"reset", "clear", "重置", "新对话", "清空"})
 _PLACEHOLDER = "🤔 正在思考…"
 
-#: 正在跑的生成：短 id -> 取消信号。
-#: 编辑模式用「⏹ 停止」按钮的 callback_data 找回来；草稿模式用 Telegram
-#: 自带的停止按钮，它只给 draft_id，所以另存一张 draft_id -> 短 id 的表。
-_GENERATIONS: dict[str, asyncio.Event] = {}
+@dataclass(slots=True)
+class _Generation:
+    """一次正在跑的生成。`gid` 编进停止按钮的 callback_data。"""
+
+    cancel: asyncio.Event
+    requester_id: int | None     # 群里只让提问者停，别人点了没反应
+    public: bool                 # 公开回复时，停止按钮要挡住旁观者
+
+
+#: 正在跑的生成：短 id -> 生成。编辑模式用「⏹ 停止」按钮的 callback_data 找回；
+#: 草稿模式用 Telegram 自带的停止按钮，它只给 draft_id，所以另存一张反向表。
+_GENERATIONS: dict[str, _Generation] = {}
 _BY_DRAFT: dict[int, str] = {}
 _SEQ = itertools.count(1)
 
 
-def _new_generation() -> tuple[str, asyncio.Event]:
+def _new_generation(
+    requester_id: int | None = None, *, public: bool = False
+) -> tuple[str, _Generation]:
     gid = f"{next(_SEQ):x}{secrets.token_hex(2)}"
-    cancel = asyncio.Event()
-    _GENERATIONS[gid] = cancel
-    return gid, cancel
+    gen = _Generation(asyncio.Event(), requester_id, public)
+    _GENERATIONS[gid] = gen
+    return gid, gen
 
 
 def _new_draft_id(gid: str) -> int:
@@ -122,16 +133,24 @@ async def cmd_q(
             "AI 还没配好：管理员需要在 .env 里填 ANIMEBOT_AI_API_KEY 后重启。"
         )
 
-    bind(query=arg[:80], model=settings.ai_model)
+    # 群里的 /q 公开回答：这是全群都有用的信息，藏起来没道理。
+    # 搜索结果相反 —— 那是某个人在找东西，公开等于替他刷屏（见 ADR-0015）。
+    public = message.chat.type in ("group", "supergroup")
+    requester = message.from_user.id if message.from_user else None
+
+    bind(query=arg[:80], model=settings.ai_model, public=public)
     conversation = conversations.get(key)
-    gid, cancel = _new_generation()
+    gid, gen = _new_generation(requester, public=public)
+    cancel = gen.cancel
     streamer: DraftStreamer | EditStreamer | None = None
     pump_task: asyncio.Task[None] | None = None
     draft_id: int | None = None
     placeholder = None
 
     try:
-        streamer, placeholder, draft_id = await _make_streamer(message, gid, settings)
+        streamer, placeholder, draft_id = await _make_streamer(
+            message, gid, settings, public=public
+        )
         if streamer is not None:
             pump_task = asyncio.create_task(streamer.pump())
 
@@ -152,7 +171,7 @@ async def cmd_q(
         if streamer is not None:
             await _stop_pump(streamer, pump_task)
             pump_task = None
-            await _emit_stop(message, streamer)
+            await _emit_stop(message, streamer, public=public)
         return
     except Exception:
         # 删掉占位消息、让在途草稿落地，把错误交回 ErrorBoundary —— 它本来就会
@@ -177,11 +196,11 @@ async def cmd_q(
         stop_reason=result.stop_reason,
     )
 
-    await _deliver(message, streamer, result.text)
+    await _deliver(message, streamer, result.text, public=public)
 
 
 async def _make_streamer(
-    message: Message, gid: str, settings: Settings
+    message: Message, gid: str, settings: Settings, *, public: bool = False
 ) -> tuple[DraftStreamer | EditStreamer | None, Message | None, int | None]:
     """按场景选流式落地方式，返回 (streamer, 占位消息, 草稿 id)。"""
     if message.bot is None:
@@ -204,6 +223,7 @@ async def _make_streamer(
     sent = await ui_reply(
         message,
         _PLACEHOLDER,
+        public=public,
         reply_markup=_stop_keyboard(gid),
         link_preview_options=_NO_PREVIEW,
     )
@@ -214,7 +234,7 @@ async def _make_streamer(
         sent=sent,
         render=to_telegram_html,
         send_extra=lambda html, **kw: ui_reply(
-            message, html, link_preview_options=_NO_PREVIEW, **kw
+            message, html, public=public, link_preview_options=_NO_PREVIEW, **kw
         ),
     )
     return streamer, sent, None
@@ -224,6 +244,8 @@ async def _deliver(
     message: Message,
     streamer: DraftStreamer | EditStreamer | None,
     text: str,
+    *,
+    public: bool = False,
 ) -> None:
     """把最终回答发出去。草稿模式要先把草稿收掉，编辑模式改占位消息。"""
     if isinstance(streamer, DraftStreamer):
@@ -233,7 +255,7 @@ async def _deliver(
             rich = to_telegram_html(chunk)
             try:
                 await ui_reply(
-                    message, rich, link_preview_options=_NO_PREVIEW,
+                    message, rich, public=public, link_preview_options=_NO_PREVIEW,
                     reply_markup=_NO_BUTTONS if index == 0 else None,
                 )
             except TelegramBadRequest as exc:
@@ -242,7 +264,8 @@ async def _deliver(
                 METRICS.incr("ai.html_fallback")
                 log.info("ai.html_fallback", error=str(exc)[:120])
                 await ui_reply(
-                    message, chunk, link_preview_options=_NO_PREVIEW, parse_mode=None
+                    message, chunk, public=public,
+                    link_preview_options=_NO_PREVIEW, parse_mode=None,
                 )
         return
 
@@ -250,7 +273,8 @@ async def _deliver(
         # 拿不到任何落地手段（极端异常）：一次性发送，功能不丢。
         for chunk in split_text(text):
             await ui_reply(
-                message, to_telegram_html(chunk), link_preview_options=_NO_PREVIEW
+                message, to_telegram_html(chunk), public=public,
+                link_preview_options=_NO_PREVIEW,
             )
         return
 
@@ -265,7 +289,9 @@ async def _deliver(
         await streamer.finish_plain(text, reply_markup=_NO_BUTTONS)
 
 
-async def _emit_stop(message: Message, streamer: DraftStreamer | EditStreamer) -> None:
+async def _emit_stop(
+    message: Message, streamer: DraftStreamer | EditStreamer, *, public: bool = False
+) -> None:
     """用户喊停：保留已经生成的部分，再补一句说明。"""
     partial = streamer.latest.strip()
     note = "⏹ 已停止生成。"
@@ -273,7 +299,7 @@ async def _emit_stop(message: Message, streamer: DraftStreamer | EditStreamer) -
     with contextlib.suppress(TelegramBadRequest):
         if isinstance(streamer, DraftStreamer):
             await streamer.settle()
-            await ui_reply(message, to_telegram_html(body),
+            await ui_reply(message, to_telegram_html(body), public=public,
                            link_preview_options=_NO_PREVIEW)
         else:
             await streamer.finish(body, reply_markup=_NO_BUTTONS)
@@ -307,20 +333,27 @@ async def on_stop(callback: CallbackQuery) -> None:
     """群里那个「⏹ 停止」按钮。草稿模式没有这个按钮（Telegram 自带）。"""
     bind(feature="ai", stopped=True)
     gid = (callback.data or "").removeprefix("qs:")
-    cancel = _GENERATIONS.get(gid)
-    if cancel is not None:
-        cancel.set()
-        METRICS.incr("ai.stop_requested")
-    await callback.answer("正在停止…" if cancel is not None else "已经结束了")
+    gen = _GENERATIONS.get(gid)
+    if gen is None:
+        await callback.answer("已经结束了")
+        return
+    # 公开回答时按钮全群可见。别人点了不给他停 —— 那是别人的提问，
+    # 但也不装作成功，明确告诉他。
+    if gen.public and gen.requester_id and callback.from_user.id != gen.requester_id:
+        await callback.answer("只有提问的人能停止", show_alert=True)
+        return
+    gen.cancel.set()
+    METRICS.incr("ai.stop_requested")
+    await callback.answer("正在停止…")
 
 
 async def on_generation_stopped(event: MessageGenerationStopped) -> None:
     """草稿模式下用户按了 Telegram 自带的「停止生成」。更新里只有 draft_id。"""
     bind(feature="ai", stopped=True)
     gid = _BY_DRAFT.get(event.draft_id)
-    cancel = _GENERATIONS.get(gid) if gid else None
-    if cancel is not None:
-        cancel.set()
+    gen = _GENERATIONS.get(gid) if gid else None
+    if gen is not None:
+        gen.cancel.set()
         METRICS.incr("ai.stop_requested")
         log.info("ai.stop_from_draft", draft_id=event.draft_id)
 

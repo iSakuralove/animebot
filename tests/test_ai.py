@@ -888,28 +888,55 @@ async def test_thinking_progress_is_reported(ai_settings: Settings) -> None:
     assert any("字" in n for n in notices)
 
 
-async def test_reveal_paces_bursty_text_into_multiple_frames() -> None:
+async def test_reveal_spreads_text_over_time() -> None:
     """网关把整段正文一次性推过来（实测 0.7s 出 130 个 delta）。
 
-    不控制回放的话，用户 0.7 秒里看不到任何中间态 —— 观感就是「没有流式」。
+    回放按**时间**摊开：不控制的话用户 0.7 秒里看不到任何中间态，观感就是
+    「没有流式」。用假时钟推进，断言每一帧都比上一帧长、并且是渐进的。
     """
     rec = EditRecorder()
-    streamer = make_streamer(rec, interval=0.0)
-    body = "".join(f"第{i}句。" for i in range(100))      # 400 字
+    now = [0.0]
+    streamer = make_streamer(rec, interval=0.0, clock=lambda: now[0])
+    body = "".join(f"第{i:03d}句。" for i in range(60))      # 360 字
     streamer.on_text(body)
 
-    task = asyncio.create_task(streamer.pump())
-    await asyncio.sleep(0.05)
-    streamer.stop()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    async def tick(step: float) -> None:
+        now[0] += step
+        await streamer._flush()
 
-    lengths = [len(text) for _, text in rec.edits]
-    assert len(lengths) >= 4, f"应该分多版长出来，实际 {lengths}"
+    await tick(0.0)
+    first = len(rec.edits[-1][1].rstrip("▌"))
+    assert first >= 10, "第一帧就要给点字，别空着"
+    assert first < len(body), "第一帧不能一次蹦完全文"
+
+    for _ in range(8):
+        await tick(0.25)
+    lengths = [len(t.rstrip("▌")) for _, t in rec.edits]   # 去掉打字光标再比
     assert lengths == sorted(lengths), "回放进度不能倒退"
-    assert lengths[0] < len(body) * 0.8, "第一版不能一次蹦完全文"
-    assert lengths[0] >= 24, "第一版至少给几个字，别一上来只有一个字"
+    assert lengths[-1] > first * 3, f"两秒后应该明显更长，实际 {lengths}"
+
+
+async def test_reveal_is_uniform_not_front_loaded() -> None:
+    """按比例递减的回放会「前几帧猛推、后面几乎不动」，看起来是跳一下再卡住。
+
+    这里钉住均匀性：每个等长时间片推进的字数大致相同。
+    """
+    rec = EditRecorder()
+    now = [0.0]
+    body = "字" * 600
+    streamer = make_streamer(rec, interval=0.0, clock=lambda: now[0])
+    streamer.on_text(body)
+
+    steps: list[int] = []
+    prev = 0
+    for _ in range(6):
+        now[0] += 0.3
+        await streamer._flush()
+        cur = len(rec.edits[-1][1].rstrip("▌")) if rec.edits else 0
+        steps.append(cur - prev)
+        prev = cur
+
+    assert max(steps) <= min(steps) * 2.5, f"推进应当均匀，实际 {steps}"
 
 
 async def test_reveal_finishes_immediately_on_finish() -> None:
@@ -943,7 +970,8 @@ async def test_notice_yields_to_streaming_text() -> None:
     streamer.set_notice("🤔 正在思考…")
     streamer.on_text("答案开头")
     await streamer._flush()
-    assert rec.edits[-1][1] == "答案开头", "正文一出现就撤掉提示行"
+    assert rec.edits[-1][1].startswith("答案开头"), "正文一出现就撤掉提示行"
+    assert "正在思考" not in rec.edits[-1][1]
 
     streamer.set_notice("🌐 正在联网搜索…")
     await streamer._flush()

@@ -228,6 +228,7 @@ async def _deliver(
     """把最终回答发出去。草稿模式要先把草稿收掉，编辑模式改占位消息。"""
     if isinstance(streamer, DraftStreamer):
         await streamer.settle()
+        bind(stream_frames=streamer.frames)
         for index, chunk in enumerate(split_text(text)):
             rich = to_telegram_html(chunk)
             try:
@@ -253,6 +254,7 @@ async def _deliver(
             )
         return
 
+    bind(stream_frames=streamer.frames)
     try:
         await streamer.finish(text, reply_markup=_NO_BUTTONS)
     except TelegramBadRequest as exc:

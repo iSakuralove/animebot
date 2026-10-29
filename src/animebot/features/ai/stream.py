@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import Awaitable, Callable
 
 from aiogram import Bot
@@ -61,17 +62,29 @@ _EDIT_INTERVAL = 0.25
 _MAX_INTERVAL = 6.0
 #: 单条消息的字符预算。Telegram 上限 4096，HTML 实体还会再涨一些。
 _MESSAGE_CAP = 3500
-#: 每次 tick 至少推进这么多字。
-_REVEAL_MIN = 12
-#: 每次 tick 推进剩余量的比例。越小越平滑、越长。
-_DRAFT_REVEAL = 0.22      # 草稿有动画，可以慢一点，更像在打字
-_EDIT_REVEAL = 0.35       # 编辑没有动画，太慢会显得卡住
+#: 回放按**时间**摊开，而不是按比例递减 —— 比例递减的结果是前几帧一大段、
+#: 后面几乎不动，看起来像「猛地跳一下然后卡住」。
+#: 目标：让整段文字在 _reveal_seconds() 秒内均匀长完。
+_CHARS_PER_SECOND = 280.0
+_REVEAL_MIN_S = 0.8
+_REVEAL_MAX_S = 2.5
+#: 第一帧至少给这么多字。给 0 的话开头几帧是空的，用户以为没反应。
+_REVEAL_MIN_CHARS = 10
+#: 打字光标。隔帧切换 → 视觉上就是闪烁。Telegram 没有原生光标，只能自己画。
+_CARET = "▌"
+#: 收尾时最多再等这么久把剩余文字「写完」，超过就落终态。
+_DRAIN_MAX_S = 2.0
 #: 收尾前等一个往返，让在途的草稿落地（否则它会和正式消息并存）。
 _SETTLE = 0.5
 
 #: 续篇发送器：收到（可带 parse_mode=None 的）文本，发出去。由 handler 提供，
 #: 群里走 ephemeral。超长回答和 HTML 降级都靠它补后续分片。
 SendExtra = Callable[..., Awaitable[object]]
+
+
+def _reveal_seconds(chars: int) -> float:
+    """一段文字在屏幕上涨完要多久。按阅读速度估，再夹到合理区间。"""
+    return min(_REVEAL_MAX_S, max(_REVEAL_MIN_S, chars / _CHARS_PER_SECOND))
 
 
 def compose(notice: str, body: str) -> str:
@@ -115,11 +128,11 @@ class _Pacer:
         *,
         render: Callable[[str], str],
         interval: float,
-        reveal_ratio: float,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.render = render
         self.interval = interval
-        self.reveal_ratio = reveal_ratio
+        self._clock = clock
         self._notice = ""
         self._body = ""
         self._revealed = 0
@@ -127,6 +140,9 @@ class _Pacer:
         self._dirty = asyncio.Event()
         self._stopping = False
         self._broken = False
+        self._started: float | None = None   # 正文第一次到达的时刻
+        self._tick = 0
+        self._frames = 0                     # 实际发出了几版，收尾时打日志
 
     # ---------------------------------------------------------- 输入
     def on_text(self, body: str) -> None:
@@ -137,6 +153,8 @@ class _Pacer:
         """
         if body and self._notice:
             self._notice = ""
+        if body and self._started is None:
+            self._started = self._clock()
         self._body = body
         self._revealed = min(self._revealed, len(body))
         self._dirty.set()
@@ -158,19 +176,18 @@ class _Pacer:
         节流按「两次**发出**之间的间隔」算：`_push` 本身要一个网络往返，
         把它算进间隔才能保证节奏稳定。
         """
-        loop = asyncio.get_running_loop()
         try:
             while not self._stopping:
                 await self._dirty.wait()
                 self._dirty.clear()
                 if self._stopping:
                     return
-                started = loop.time()
+                started = self._clock()
                 await self._flush()
                 # 回放还没追上缓冲区：这一版不是终点，继续排下一版。
                 if self._revealed < len(self._body) and not self._broken:
                     self._dirty.set()
-                await asyncio.sleep(max(0.0, self.interval - (loop.time() - started)))
+                await asyncio.sleep(max(0.0, self.interval - (self._clock() - started)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -181,11 +198,17 @@ class _Pacer:
             return
         self._advance()
         text = self.render(self._visible[:_MESSAGE_CAP])
+        if text and self._body and not self._stopping:
+            # 隔帧切光标：Telegram 没有原生打字光标，自己画一个才有「还在写」的观感。
+            self._tick += 1
+            if self._tick % 2 == 1:
+                text += _CARET
         if not text or text == self._shown:
             return
         try:
             await self._push(text)
             self._shown = text
+            self._frames += 1
         except TelegramRetryAfter as exc:
             # 撞限流：放慢节奏，这一版稍后重试。可恢复，不算故障。
             self.interval = max(self.interval, _DRAFT_INTERVAL) * 1.6
@@ -204,15 +227,41 @@ class _Pacer:
         raise NotImplementedError
 
     def _advance(self) -> None:
-        """把回放进度往前推一段。收尾阶段（`_stopping`）直接到头。"""
-        remaining = len(self._body) - self._revealed
-        if remaining <= 0:
+        """按时间把显示进度推到该到的位置。
+
+        为什么按时间而不是「每帧推剩余量的一部分」：后者前几帧猛推一大段、后面
+        几乎不动，看起来是「跳一下再卡住」。按时间摊开后，如果拿到的帧率高，
+        每帧推进的字符就少（像打字）；帧率低就自动少刷几版但总时长不变。
+        """
+        total = len(self._body)
+        if self._revealed >= total:
             return
-        if self._stopping:
-            self._revealed = len(self._body)
+        if self._stopping or self._started is None:
+            self._revealed = total
             return
-        step = max(_REVEAL_MIN, int(remaining * self.reveal_ratio + 0.999))
-        self._revealed = min(len(self._body), self._revealed + step)
+        elapsed = max(0.0, self._clock() - self._started)
+        span = _reveal_seconds(total)
+        want = int(total * min(1.0, elapsed / span))
+        self._revealed = max(self._revealed, min(total, max(want, _REVEAL_MIN_CHARS)))
+
+    async def drain(self) -> None:
+        """收尾前把剩下的文字按同样节奏写完，别在最后猛跳一下。
+
+        有上限（`_DRAIN_MAX_S`）：用户不该为了「好看」多等太久。超时就落终态。
+        """
+        deadline = self._clock() + _DRAIN_MAX_S
+        while self._revealed < len(self._body) and self._clock() < deadline:
+            if self._broken:
+                return
+            await self._flush()
+            if self._revealed >= len(self._body):
+                return
+            await asyncio.sleep(max(0.0, self.interval - 0.0))
+
+    @property
+    def frames(self) -> int:
+        """实际发出去了几版。收尾时打日志，用来判断「流不流」而不用猜。"""
+        return self._frames
 
     @property
     def _visible(self) -> str:
@@ -243,8 +292,9 @@ class DraftStreamer(_Pacer):
         draft_id: int,
         render: Callable[[str], str],
         interval: float = _DRAFT_INTERVAL,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        super().__init__(render=render, interval=interval, reveal_ratio=_DRAFT_REVEAL)
+        super().__init__(render=render, interval=interval, clock=clock)
         self.bot = bot
         self.chat_id = chat_id
         self.draft_id = draft_id
@@ -260,13 +310,17 @@ class DraftStreamer(_Pacer):
         草稿和正式消息不能并存：文档说「bot 发消息时草稿消失」，但那只在草稿
         请求全部落地之后才成立。第一版正是漏了这一步，用户看到「回了两条」。
 
-        先 `_flush` 一次是因为 pump 可能还没跑过（引擎很快，或者刚创建就被叫停）——
-        不推的话草稿一版都没出现，用户只看到最后那条正式消息。
+        先 `drain()` 把剩余文字按节奏写完（pump 可能还没跑过，或者生成比回放快），
+        再等一个往返还让最后那版落地 —— 否则它会在正式消息之后冒出来。
+
+        **注意这里不强制跳到全文**：草稿后面紧跟着正式消息，它不需要「完整」。
+        强制跳会让最后一眼是「啪一下变全文」，正是用户说的僵硬。
+        编辑模式相反 —— 那一条就是最终消息，必须完整（见 `finish`）。
         """
-        self.stop()
         with contextlib.suppress(TelegramBadRequest, TelegramRetryAfter):
-            await self._flush()
+            await self.drain()
         await asyncio.sleep(_SETTLE)
+        self.stop()
 
 
 class EditStreamer(_Pacer):
@@ -280,8 +334,9 @@ class EditStreamer(_Pacer):
         render: Callable[[str], str],
         send_extra: SendExtra,
         interval: float = _EDIT_INTERVAL,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        super().__init__(render=render, interval=interval, reveal_ratio=_EDIT_REVEAL)
+        super().__init__(render=render, interval=interval, clock=clock)
         self.bot = bot
         self.sent = sent
         self.send_extra = send_extra
